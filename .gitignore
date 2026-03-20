@@ -10,3 +10,7 @@ checkpoints_drum/*
 drum_dataset/*
 drum_prepare/*
 remi_dataset/*
+
+!/drum_dataset/.gitkeep
+!/drum_prepare/.gitkeep
+!/remi_dataset/.gitkeep
