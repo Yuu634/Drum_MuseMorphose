@@ -5,3 +5,8 @@
 **/*ckpt*/
 **/*.pt
 **/gens/
+
+checkpoints_drum/*
+drum_dataset/*
+drum_prepare/*
+remi_dataset/*
