@@ -12,23 +12,27 @@ POSITIONS_PER_BEAT = 24
 DEFAULT_BPM = 120
 
 # ドラム楽器からMIDIノート番号へのマッピング（逆引き）
+# drum_tokenizer.pyのDRUM_NOTE_MAPと対応させる
 DRUM_TO_NOTE = {
     'KICK': 36,
-    'SNARE': 38,
-    'SNARE_XSTICK': 37,
+    'SNARE': 38,           # D2 (MIDI 38)
+    'SNARE_ACCENT': 37,    # C#2 (MIDI 37) - Snare accent
+    'SNARE_XSTICK': 39,
     'SNARE_RIMSHOT': 40,
-    'TOM1': 45,
-    'TOM2': 48,
-    'FLOOR': 41,
-    'HH_CLOSED': 42,
-    'HH_HALFOPEN': 44,  # ペダルハイハットで代用
-    'HH_OPEN': 46,
-    'HH_PEDAL': 44,
-    'RIDE_BOW': 51,
+    'TOM1': 48,            # C3 (MIDI 48)
+    'TOM2': 47,            # B2 (MIDI 47)
+    'FLOOR': 43,           # G2 (MIDI 43)
+    'HH_CLOSED': 42,       # F#2 (MIDI 42)
+    'HH_HALFOPEN': 44,     # G#2
+    'HH_OPEN': 46,         # A#2 (MIDI 46)
+    'HH_PEDAL': 44,        # G#2 (MIDI 44)
+    'RIDE_BOW': 51,        # D#3 (MIDI 51)
     'RIDE_BELL': 53,
     'CRASH': 49,
     'SPLASH': 55,
-    'CHINA': 52,
+    'CHINA': 52,           # E3 (MIDI 52)
+    'TAMBOURINE': 54,      # F#3 (MIDI 54)
+    'COWBELL': 56,         # G#3 (MIDI 56)
 }
 
 # ベロシティレベルのマッピング
@@ -60,7 +64,7 @@ class DrumToken2MIDI:
             return None
 
         # 楽器名を構築（2単語の可能性がある: HH_CLOSED, RIDE_BOWなど）
-        if parts[1] in ['CLOSED', 'HALFOPEN', 'OPEN', 'PEDAL', 'BOW', 'BELL']:
+        if parts[1] in ['CLOSED', 'HALFOPEN', 'OPEN', 'PEDAL', 'BOW', 'BELL', 'ACCENT']:
             instrument = f"{parts[0]}_{parts[1]}"
             technique = parts[2]
             velocity_level = '_'.join(parts[3:]) if len(parts) > 3 else 'Normal'
@@ -81,6 +85,8 @@ class DrumToken2MIDI:
             return DRUM_TO_NOTE.get(f'{instrument}_XSTICK')
         elif technique == 'RIMSHOT':
             return DRUM_TO_NOTE.get(f'{instrument}_RIMSHOT')
+        elif technique == 'ACCENT':
+            return DRUM_TO_NOTE.get(f'{instrument}_ACCENT')
         else:
             return DRUM_TO_NOTE.get(instrument)
 
@@ -125,6 +131,15 @@ class DrumToken2MIDI:
             miditoolkit.TempoChange(bpm, 0)
         )
 
+        # トークン列から最大小節番号を取得（<BAR>トークンの総数 = 小節総数）
+        max_bar = 0
+        for token in tokens:
+            if token == '<BAR>':
+                max_bar += 1
+        
+        # 予期される全小節数を記録（空の小節を含む）
+        total_bars = max_bar
+
         # トークンを解析してノートイベントを生成
         current_bar = 0
         current_beat = 0
@@ -135,10 +150,17 @@ class DrumToken2MIDI:
 
         for i, token in enumerate(tokens):
             if token == '<BAR>':
+                # 新しい小節を開始（空の小節も含める）
                 current_bar += 1
                 current_beat = 0
                 current_pos = 0
                 current_tick = (current_bar - 1) * DEFAULT_BAR_RESOL
+                
+                # 空小節追加
+                if tokens[i+1] == '<BAR>':
+                    midi_obj.markers.append(
+                        miditoolkit.Marker(f'Bar-{current_bar}', (current_bar - 1) * DEFAULT_BAR_RESOL)
+                    )
 
             elif token.startswith('<BEAT_'):
                 beat_num = int(token.replace('<BEAT_', '').replace('>', ''))
@@ -237,11 +259,15 @@ class DrumToken2MIDI:
         # ドラムトラックを追加
         midi_obj.instruments.append(drum_track)
 
-        # 小節マーカーを追加
-        for bar in range(current_bar):
-            midi_obj.markers.append(
-                miditoolkit.Marker(f'Bar-{bar + 1}', bar * DEFAULT_BAR_RESOL)
-            )
+        # 全小節のマーカーを追加（空の小節を含む）
+        # これにより、元譜面の全小節が再構築される
+        #for bar in range(total_bars):
+        #    midi_obj.markers.append(
+        #        miditoolkit.Marker(f'Bar-{bar + 1}', bar * DEFAULT_BAR_RESOL)
+        #    )
+
+        # MIDIの終了時刻を設定（全小節を包含するように）
+        midi_obj.end_time = total_bars * DEFAULT_BAR_RESOL
 
         # ファイル保存
         if output_path is not None:

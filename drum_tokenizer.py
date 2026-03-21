@@ -12,36 +12,39 @@ DEFAULT_BEAT_RESOL = 480
 DEFAULT_BAR_RESOL = 480 * 4
 POSITIONS_PER_BEAT = 24  # 1拍を24分割
 
-# GM Drum Map (General MIDI standard)
+# ドラム譜用のノートマッピング (カスタムマッピング)
 DRUM_NOTE_MAP = {
     # Kick
     35: ('KICK', 'HIT'),
     36: ('KICK', 'HIT'),
 
-    # Snare
+    # Snare - D2 (MIDI 38)
     38: ('SNARE', 'HIT'),
     40: ('SNARE', 'HIT'),
-    37: ('SNARE', 'XSTICK'),  # Side stick
+    37: ('SNARE', 'ACCENT'),  # C#2 - Snare accent
+    39: ('SNARE', 'XSTICK'),  # Side stick
 
-    # Tom
-    41: ('TOM1', 'HIT'),  # Low floor tom
-    43: ('TOM1', 'HIT'),  # High floor tom
+    # Floor tom - F2 (MIDI 41) or G2 (MIDI 43)
+    41: ('FLOOR', 'HIT'),  # F2
+    43: ('FLOOR', 'HIT'),  # G2
+
+    # Tom1 - C3 (MIDI 48)
+    48: ('TOM1', 'HIT'),  # C3
+
+    # Tom2 - B2 (MIDI 47)
     45: ('TOM2', 'HIT'),  # Low tom
-    47: ('TOM2', 'HIT'),  # Low-mid tom
-    48: ('TOM2', 'HIT'),  # Hi-mid tom
+    47: ('TOM2', 'HIT'),  # B2
     50: ('TOM2', 'HIT'),  # High tom
 
-    # Floor tom
-    41: ('FLOOR', 'HIT'),
-    43: ('FLOOR', 'HIT'),
+    # Hi-hat Closed - F#2 (MIDI 42)
+    42: ('HH_CLOSED', 'HIT'),  # F#2 - Closed hi-hat
+    44: ('HH_PEDAL', 'HIT'),  # G#2 - Pedal hi-hat
 
-    # Hi-hat
-    42: ('HH_CLOSED', 'HIT'),  # Closed hi-hat
-    44: ('HH_CLOSED', 'PEDAL'),  # Pedal hi-hat
-    46: ('HH_OPEN', 'HIT'),  # Open hi-hat
+    # Hi-hat Open - A#2 (MIDI 46)
+    46: ('HH_OPEN', 'HIT'),  # A#2 - Open hi-hat
 
-    # Ride
-    51: ('RIDE_BOW', 'HIT'),  # Ride cymbal 1
+    # Ride - D#3 (MIDI 51)
+    51: ('RIDE_BOW', 'HIT'),  # D#3 - Ride cymbal
     59: ('RIDE_BOW', 'HIT'),  # Ride cymbal 2
     53: ('RIDE_BELL', 'HIT'),  # Ride bell
 
@@ -50,8 +53,10 @@ DRUM_NOTE_MAP = {
     57: ('CRASH', 'HIT'),  # Crash cymbal 2
 
     # Other cymbals
-    52: ('CHINA', 'HIT'),  # Chinese cymbal
+    52: ('CHINA', 'HIT'),  # E3 - Chinese cymbal
     55: ('SPLASH', 'HIT'),  # Splash cymbal
+    54: ('TAMBOURINE', 'HIT'),  # F#3 - Tambourine
+    56: ('COWBELL', 'HIT'),  # G#3 - Cowbell
 }
 
 
@@ -84,6 +89,7 @@ class DrumTokenizer:
             vocab.extend([
                 f'SNARE_RIMSHOT_{vel}',
                 f'SNARE_XSTICK_{vel}',
+                f'SNARE_ACCENT_{vel}',
                 f'SNARE_FLAM_{vel}'
             ])
         vocab.append('SNARE_ROLL')
@@ -106,9 +112,9 @@ class DrumTokenizer:
         for vel in ['Normal', 'Accent']:
             vocab.extend([
                 f'HH_HALFOPEN_HIT_{vel}',
-                f'HH_OPEN_HIT_{vel}'
+                f'HH_OPEN_HIT_{vel}',
+                f'HH_PEDAL_HIT_{vel}'
             ])
-        vocab.append('HH_PEDAL')
 
         # ライドシンバル
         for vel in ['Ghost', 'Normal', 'Accent']:
@@ -117,7 +123,7 @@ class DrumTokenizer:
             vocab.append(f'RIDE_BELL_HIT_{vel}')
 
         # クラッシュ・その他シンバル
-        for cymbal in ['CRASH', 'SPLASH', 'CHINA']:
+        for cymbal in ['CRASH', 'SPLASH', 'CHINA', 'TAMBOURINE', 'COWBELL']:
             for vel in ['Normal', 'Accent']:
                 vocab.append(f'{cymbal}_HIT_{vel}')
             vocab.append(f'{cymbal}_CHOKE')
@@ -172,7 +178,7 @@ class DrumTokenizer:
             # シンバル類で極端に短い音価の場合、チョークとみなす
             if note.pitch in DRUM_NOTE_MAP:
                 drum_type = DRUM_NOTE_MAP[note.pitch][0]
-                if drum_type in ['CRASH', 'SPLASH', 'CHINA', 'RIDE_BOW', 'RIDE_BELL']:
+                if drum_type in ['CRASH', 'SPLASH', 'CHINA', 'RIDE_BOW', 'RIDE_BELL', 'TAMBOURINE', 'COWBELL']:
                     if duration < DEFAULT_BEAT_RESOL / 4:  # 16分音符未満
                         chokes[i] = note.end
 
@@ -206,6 +212,11 @@ class DrumTokenizer:
         flams = self._detect_flam(drum_track.notes)
         chokes = self._detect_choke(drum_track.notes)
         processed_notes = set()  # フラムの前打音をスキップするため
+
+        # フラムのgrace noteを事前にスキップリストに追加
+        for main_idx, grace_indices in flams.items():
+            for grace_idx in grace_indices:
+                processed_notes.add(grace_idx)
 
         tokens = []
         bar_positions = []

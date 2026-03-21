@@ -7,9 +7,11 @@
 **/gens/
 
 checkpoints_drum/*
+checkpoints_drum_gpu/*
 drum_dataset/*
 drum_prepare/*
 remi_dataset/*
+*.zip
 
 !drum_dataset/.gitkeep
 !drum_prepare/.gitkeep

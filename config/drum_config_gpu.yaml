@@ -1,4 +1,4 @@
-# ドラム譜MuseMorphose学習設定ファイル
+# ドラム譜MuseMorphose学習設定ファイル（GPU最適化版）
 
 # データ設定
 data:
@@ -9,8 +9,8 @@ data:
   enc_seqlen: 128                         # エンコーダー最大系列長
   dec_seqlen: 1280                        # デコーダー最大系列長
   max_bars: 16                            # 最大小節数
-  batch_size: 4                           # バッチサイズ
-  num_workers: 0                          # データローダーのワーカー数 (0=メインスレッドのみ)
+  batch_size: 8                           # バッチサイズ（GPUメモリに応じて調整）
+  num_workers: 4                          # データローダーのワーカー数
 
 # モデル設定
 model:
@@ -41,8 +41,8 @@ model:
 
 # 学習設定
 training:
-  device: 'cpu'                           # デバイス ('cuda' or 'cpu', or 'auto' for automatic selection)
-  use_amp: true                           # Mixed Precision Training（AMPを使用してGPUメモリを節約、CUDAのみ）
+  device: 'cuda'                          # デバイス ('cuda' or 'cpu')
+  use_amp: true                           # Mixed Precision Training（メモリ節約と高速化）
   max_epochs: 100                         # 最大エポック数
   trained_steps: 0                        # 学習済みステップ数（再開用）
 
@@ -60,7 +60,7 @@ training:
   free_bit_lambda: 0.0                    # Free bitラムダ値
 
   # チェックポイントとログ
-  ckpt_dir: './checkpoints_drum'          # チェックポイントディレクトリ
+  ckpt_dir: './checkpoints_drum_gpu'      # チェックポイントディレクトリ
   ckpt_interval: 5000                     # チェックポイント保存間隔
   log_interval: 100                       # ログ記録間隔
   val_interval: 2000                      # 検証実行間隔

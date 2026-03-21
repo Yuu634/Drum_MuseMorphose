@@ -59,7 +59,7 @@ def compute_loss_ema(ema, batch_loss, decay=0.95):
         return batch_loss * (1 - decay) + ema * decay
 
 
-def train_model(epoch, model, dloader, dloader_val, optim, sched, config, trained_steps):
+def train_model(epoch, model, dloader, dloader_val, optim, sched, config, trained_steps, scaler=None):
     """モデルの学習（1エポック）"""
     model.train()
 
@@ -76,6 +76,7 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched, config, traine
     ckpt_interval = config['training']['ckpt_interval']
     log_interval = config['training']['log_interval']
     val_interval = config['training']['val_interval']
+    use_amp = config['training'].get('use_amp', False) and device == 'cuda'
 
     params_dir = os.path.join(ckpt_dir, 'params/')
     optim_dir = os.path.join(ckpt_dir, 'optim/')
@@ -86,6 +87,8 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched, config, traine
 
     print(f'[epoch {epoch:03d}] training ...')
     print(f'[epoch {epoch:03d}] # batches = {len(dloader)}')
+    if use_amp:
+        print(f'[epoch {epoch:03d}] Mixed Precision Training enabled')
     st = time.time()
 
     for batch_idx, batch_samples in enumerate(dloader):
@@ -101,34 +104,70 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched, config, traine
         # ドラム譜では属性は使用しない（Noneを渡す）
         trained_steps += 1
 
-        mu, logvar, dec_logits = model(
-            batch_enc_inp,
-            batch_dec_inp,
-            batch_inp_bar_pos,
-            None,  # rhythm frequency class (not used for drums)
-            None,  # polyphony class (not used for drums)
-            padding_mask=batch_padding_mask
-        )
+        # Mixed Precision Training
+        if use_amp and scaler is not None:
+            with torch.cuda.amp.autocast():
+                mu, logvar, dec_logits = model(
+                    batch_enc_inp,
+                    batch_dec_inp,
+                    batch_inp_bar_pos,
+                    None,  # rhythm frequency class (not used for drums)
+                    None,  # polyphony class (not used for drums)
+                    padding_mask=batch_padding_mask
+                )
 
-        # KLベータのスケジューリング
-        if not constant_kl:
-            kl_beta = beta_cyclical_sched(trained_steps, no_kl_steps, kl_cycle_steps, kl_max_beta)
+                # KLベータのスケジューリング
+                if not constant_kl:
+                    kl_beta = beta_cyclical_sched(trained_steps, no_kl_steps, kl_cycle_steps, kl_max_beta)
+                else:
+                    kl_beta = kl_max_beta
+
+                losses = model.compute_loss(mu, logvar, kl_beta, free_bit_lambda, dec_logits, batch_dec_tgt)
+
+            # 学習率のアニーリング
+            if trained_steps < lr_warmup_steps:
+                curr_lr = max_lr * trained_steps / lr_warmup_steps
+                optim.param_groups[0]['lr'] = curr_lr
+            else:
+                sched.step(trained_steps - lr_warmup_steps)
+
+            # Scaled backward & 勾配クリッピング & モデル更新
+            scaler.scale(losses['total_loss']).backward()
+            scaler.unscale_(optim)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            scaler.step(optim)
+            scaler.update()
+
         else:
-            kl_beta = kl_max_beta
+            # 通常の学習（AMP無し）
+            mu, logvar, dec_logits = model(
+                batch_enc_inp,
+                batch_dec_inp,
+                batch_inp_bar_pos,
+                None,  # rhythm frequency class (not used for drums)
+                None,  # polyphony class (not used for drums)
+                padding_mask=batch_padding_mask
+            )
 
-        losses = model.compute_loss(mu, logvar, kl_beta, free_bit_lambda, dec_logits, batch_dec_tgt)
+            # KLベータのスケジューリング
+            if not constant_kl:
+                kl_beta = beta_cyclical_sched(trained_steps, no_kl_steps, kl_cycle_steps, kl_max_beta)
+            else:
+                kl_beta = kl_max_beta
 
-        # 学習率のアニーリング
-        if trained_steps < lr_warmup_steps:
-            curr_lr = max_lr * trained_steps / lr_warmup_steps
-            optim.param_groups[0]['lr'] = curr_lr
-        else:
-            sched.step(trained_steps - lr_warmup_steps)
+            losses = model.compute_loss(mu, logvar, kl_beta, free_bit_lambda, dec_logits, batch_dec_tgt)
 
-        # 勾配クリッピング & モデル更新
-        losses['total_loss'].backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-        optim.step()
+            # 学習率のアニーリング
+            if trained_steps < lr_warmup_steps:
+                curr_lr = max_lr * trained_steps / lr_warmup_steps
+                optim.param_groups[0]['lr'] = curr_lr
+            else:
+                sched.step(trained_steps - lr_warmup_steps)
+
+            # 勾配クリッピング & モデル更新
+            losses['total_loss'].backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            optim.step()
 
         # EMAの更新
         recons_loss_ema = compute_loss_ema(recons_loss_ema, losses['recons_loss'].item())
@@ -386,6 +425,13 @@ def main():
         optimizer, lr_decay_steps, eta_min=min_lr
     )
 
+    # Mixed Precision Training用のGradScaler（CUDAのみ）
+    use_amp = config['training'].get('use_amp', False) and device == 'cuda'
+    scaler = None
+    if use_amp:
+        scaler = torch.cuda.amp.GradScaler()
+        print('[info] Mixed Precision Training (AMP) enabled')
+
     # ディレクトリを作成
     if not os.path.exists(ckpt_dir):
         os.makedirs(ckpt_dir)
@@ -409,7 +455,8 @@ def main():
             optimizer,
             scheduler,
             config,
-            trained_steps
+            trained_steps,
+            scaler=scaler
         )
 
     print('[info] Training completed!')
