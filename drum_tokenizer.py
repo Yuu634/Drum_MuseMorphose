@@ -96,6 +96,10 @@ class DrumTokenizer:
         # 特殊トークン
         vocab.extend(['<PAD>', '<EOS>', '<BAR>'])
 
+        # テンポトークン (60-240 BPM, 5刻み)
+        for tempo in range(60, 245, 5):
+            vocab.append(f'<TEMPO_{tempo}>')
+
         # 拍トークン (4拍子のみサポート)
         vocab.extend([f'<BEAT_{i}>' for i in range(1, 5)])
 
@@ -192,7 +196,7 @@ class DrumTokenizer:
     def _detect_choke(self, notes: List[miditoolkit.Note]) -> Dict[int, int]:
         """
         チョークを検出 (Note Offが極端に短い)
-        
+
         注: CRASH、SPLASH、CHINA、RIDE、TAMBOURINE、COWBELLなどのシンバル類は
         自然に短い音が多いため、自動チョーク検出は無効化
         これにより往復変換時のノート欠損を防ぐ
@@ -203,6 +207,100 @@ class DrumTokenizer:
         # チョーク検出を無効化して空の辞書を返す
         # これにより、全ノートが通常の演奏トークンとしてトークン化される
         return {}
+
+    def _quantize_tempo(self, bpm: float) -> int:
+        """
+        テンポを5 BPM刻みに量子化
+
+        Args:
+            bpm: 元のBPM値
+
+        Returns:
+            量子化されたBPM値 (60-240の範囲、5刻み)
+        """
+        # 5刻みの上側ビンへ量子化
+        # 例: 121-125 -> 125, 126-130 -> 130
+        quantized = int(np.ceil(float(bpm) / 5.0)) * 5
+        return max(60, min(240, quantized))
+
+    def _get_tempo_at_tick(self, midi_obj: miditoolkit.MidiFile, tick: int) -> float:
+        """
+        指定されたtick位置でのテンポを取得
+
+        Args:
+            midi_obj: MIDIファイルオブジェクト
+            tick: tick位置
+
+        Returns:
+            そのtick位置でのBPM値
+        """
+        if not midi_obj.tempo_changes:
+            return 120.0  # デフォルトBPM
+
+        # 指定されたtick以前の最後のテンポ変更を探す
+        current_tempo = 120.0
+        for tempo_change in midi_obj.tempo_changes:
+            if tempo_change.time <= tick:
+                current_tempo = tempo_change.tempo
+            else:
+                break
+
+        return current_tempo
+
+    def _infer_effective_ticks_per_beat(
+        self,
+        midi_obj: miditoolkit.MidiFile,
+        notes: List[miditoolkit.Note]
+    ) -> int:
+        """
+        ノート配置から実効的なticks_per_beatを推定する。
+
+        一部のMIDIはヘッダ上のticks_per_beatと実データのグリッドが
+        食い違うことがあり、そのまま正規化すると時間軸が1/4化する。
+        24分割グリッドへの量子化誤差が最小になるTPBを候補から選び、
+        ヘッダ値と比べて十分に改善する場合のみ採用する。
+        """
+        declared_tpb = int(midi_obj.ticks_per_beat) if midi_obj.ticks_per_beat > 0 else DEFAULT_BEAT_RESOL
+
+        if not notes:
+            return declared_tpb
+
+        # 実運用で遭遇しやすいTPB候補（ヘッダ値を最優先候補として含める）
+        candidates = [declared_tpb]
+        for tpb in (120, 240, 480, 960, 1920):
+            if tpb not in candidates:
+                candidates.append(tpb)
+
+        note_starts = [int(n.start) for n in notes]
+
+        def quantization_error(tpb: int) -> float:
+            if tpb <= 0:
+                return float('inf')
+
+            errors = []
+            for start_tick in note_starts:
+                tick_in_beat = start_tick % tpb
+                pos_float = (tick_in_beat * POSITIONS_PER_BEAT) / tpb
+                pos_nearest = round(pos_float)
+                errors.append(abs(pos_float - pos_nearest))
+
+            return float(np.mean(errors)) if errors else float('inf')
+
+        declared_error = quantization_error(declared_tpb)
+        best_tpb = declared_tpb
+        best_error = declared_error
+
+        for candidate in candidates:
+            cand_error = quantization_error(candidate)
+            if cand_error < best_error:
+                best_error = cand_error
+                best_tpb = candidate
+
+        # 微小差分での過剰補正を防ぐため、十分な改善時のみ切り替える
+        if best_tpb != declared_tpb and (declared_error - best_error) >= 0.05:
+            return best_tpb
+
+        return declared_tpb
 
     def midi_to_tokens(self, midi_path: str) -> Tuple[List[str], List[int]]:
         """
@@ -224,6 +322,22 @@ class DrumTokenizer:
         if drum_track is None:
             raise ValueError("No drum track found in MIDI file")
 
+        # ===== 重要: ticks_per_beatの正規化 =====
+        # ヘッダ値が実データと不整合なMIDIがあるため、実効TPBを推定してから正規化する
+        effective_tpb = self._infer_effective_ticks_per_beat(midi_obj, drum_track.notes)
+        scale_factor = DEFAULT_BEAT_RESOL / effective_tpb
+
+        if scale_factor != 1.0:
+            # すべてのノートの位置を正規化
+            for note in drum_track.notes:
+                note.start = int(note.start * scale_factor)
+                note.end = int(note.end * scale_factor)
+
+            # テンポ変更の位置も正規化
+            for tempo_change in midi_obj.tempo_changes:
+                tempo_change.time = int(tempo_change.time * scale_factor)
+        # ==========================================
+
         # 小節数を計算
         max_tick = max(note.end for note in drum_track.notes) if drum_track.notes else 0
         n_bars = int(np.ceil(max_tick / DEFAULT_BAR_RESOL))
@@ -243,9 +357,18 @@ class DrumTokenizer:
 
         for bar in range(n_bars):
             bar_positions.append(len(tokens))
+
+            # 小節開始位置でのテンポを取得して量子化
+            bar_start_tick = bar * DEFAULT_BAR_RESOL
+            tempo_at_bar = self._get_tempo_at_tick(midi_obj, bar_start_tick)
+            quantized_tempo = self._quantize_tempo(tempo_at_bar)
+
+            # テンポトークンを追加
+            tempo_token = f'<TEMPO_{quantized_tempo}>'
+            tokens.append(tempo_token)
+
             tokens.append('<BAR>')
 
-            bar_start_tick = bar * DEFAULT_BAR_RESOL
             bar_end_tick = (bar + 1) * DEFAULT_BAR_RESOL
 
             # この小節内のすべてのイベント（ノートとチョーク）を収集

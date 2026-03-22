@@ -99,6 +99,15 @@ class DrumToken2MIDI:
         else:
             return DEFAULT_BEAT_RESOL // 8  # 32分音符（デフォルト）
 
+    def _parse_tempo_token(self, token: str) -> Optional[int]:
+        """テンポトークンをBPM整数に変換"""
+        if not isinstance(token, str) or not token.startswith('<TEMPO_'):
+            return None
+        try:
+            return int(token.replace('<TEMPO_', '').replace('>', ''))
+        except ValueError:
+            return None
+
     def tokens_to_midi(
         self,
         tokens: List[str],
@@ -111,13 +120,13 @@ class DrumToken2MIDI:
         Args:
             tokens: トークン列
             output_path: 出力MIDIファイルパス（Noneの場合は保存しない）
-            bpm: テンポ（BPM）
+            bpm: テンポ（BPM）。Noneの場合はトークン列から自動検出
 
         Returns:
             MidiFile オブジェクト
         """
-        if bpm is None:
-            bpm = self.default_bpm
+        # bpm引数はテンポトークンが存在しない場合のフォールバックとして扱う
+        fallback_bpm = self.default_bpm if bpm is None else int(bpm)
 
         # MIDIオブジェクト作成
         midi_obj = miditoolkit.MidiFile()
@@ -126,10 +135,20 @@ class DrumToken2MIDI:
         # ドラムトラック作成
         drum_track = miditoolkit.Instrument(program=0, is_drum=True, name='Drums')
 
-        # テンポ設定
-        midi_obj.tempo_changes.append(
-            miditoolkit.TempoChange(bpm, 0)
-        )
+        # 最初のテンポトークンを検出し、time=0へ初期テンポを必ず設定
+        first_token_tempo = None
+        for token in tokens:
+            parsed_tempo = self._parse_tempo_token(token)
+            if parsed_tempo is not None:
+                first_token_tempo = parsed_tempo
+                break
+
+        initial_tempo = first_token_tempo if first_token_tempo is not None else fallback_bpm
+        midi_obj.tempo_changes.append(miditoolkit.TempoChange(initial_tempo, 0))
+
+        # テンポ設定は「楽曲の最初」または「テンポ切替時」のみ追加する
+        current_tempo = initial_tempo
+        pending_tempo = None
 
         # トークン列から最大小節番号を取得（<BAR>トークンの総数 = 小節総数）
         max_bar = 0
@@ -149,15 +168,27 @@ class DrumToken2MIDI:
         choke_events = []  # チョークイベントのリスト
 
         for i, token in enumerate(tokens):
-            if token == '<BAR>':
+            if token.startswith('<TEMPO_'):
+                # テンポトークンは次の時間境界（通常は<BAR>）で適用する
+                pending_tempo = self._parse_tempo_token(token)
+                continue
+
+            elif token == '<BAR>':
                 # 新しい小節を開始（空の小節も含める）
                 current_bar += 1
                 current_beat = 0
                 current_pos = 0
                 current_tick = (current_bar - 1) * DEFAULT_BAR_RESOL
-                
+
+                # 小節先頭でテンポを確定（開始時または変更時のみ追加）
+                target_tempo = pending_tempo if pending_tempo is not None else current_tempo
+                if target_tempo != current_tempo:
+                    midi_obj.tempo_changes.append(miditoolkit.TempoChange(target_tempo, current_tick))
+                    current_tempo = target_tempo
+                pending_tempo = None
+
                 # 空小節追加
-                if tokens[i+1] == '<BAR>':
+                if i + 1 < len(tokens) and tokens[i+1] == '<BAR>':
                     midi_obj.markers.append(
                         miditoolkit.Marker(f'Bar-{current_bar}', (current_bar - 1) * DEFAULT_BAR_RESOL)
                     )
@@ -279,7 +310,7 @@ class DrumToken2MIDI:
 def tokens_to_midi(
     tokens: List[str],
     output_path: str,
-    bpm: int = 120
+    bpm: Optional[int] = None
 ) -> miditoolkit.MidiFile:
     """
     ユーティリティ関数: トークン列をMIDIファイルに変換
@@ -287,12 +318,12 @@ def tokens_to_midi(
     Args:
         tokens: トークン列
         output_path: 出力MIDIファイルパス
-        bpm: テンポ（BPM）
+        bpm: テンポ（BPM）。テンポトークンが無い場合のみフォールバックとして使用
 
     Returns:
         MidiFile オブジェクト
     """
-    converter = DrumToken2MIDI(default_bpm=bpm)
+    converter = DrumToken2MIDI(default_bpm=DEFAULT_BPM if bpm is None else bpm)
     return converter.tokens_to_midi(tokens, output_path, bpm)
 
 

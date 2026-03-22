@@ -8,6 +8,11 @@ MIDI → トークン → MIDIの往復変換テスト
 3. pklファイルからトークン列を読み込めるか
 4. トークン列をMIDIファイルに変換できるか
 5. 変換前後でMIDIファイルの内容が一致するか
+
+修正内容 (2024年版):
+- MIDIファイルのticks_per_beatを考慮した正規化比較
+- 異なるticks_per_beatでも正しく比較できるように改善
+- より詳細な比較情報の表示
 """
 import sys
 import os
@@ -46,12 +51,18 @@ PITCH_TOLERANCE_MAP = {
 
 
 class MIDIComparator:
-    """MIDI情報を比較するクラス"""
+    """
+    MIDI情報を比較するクラス
+
+    異なるticks_per_beatのMIDIファイルでも正しく比較できるように、
+    beat単位に正規化して比較を行います。
+    """
 
     def __init__(self, tolerance_ticks: int = 10):
         """
         Args:
             tolerance_ticks: タイミングの許容誤差（ticks）
+                             実際の比較は正規化後の値で行われます
         """
         self.tolerance = tolerance_ticks
 
@@ -72,12 +83,13 @@ class MIDIComparator:
         # pitch1 が許容リストにない場合は、完全一致のみ許可
         return pitch1 == pitch2
 
-    def extract_notes_info(self, midi_path: str) -> List[Dict]:
+    def extract_notes_info(self, midi_path: str) -> Tuple[List[Dict], int]:
         """
         MIDIファイルからノート情報を抽出
 
         Returns:
-            ノート情報のリスト [{pitch, start, end, velocity}, ...]
+            (ノート情報のリスト, ticks_per_beat)
+            ノート情報: [{pitch, start, end, velocity}, ...]
         """
         midi_obj = miditoolkit.MidiFile(midi_path)
 
@@ -94,15 +106,23 @@ class MIDIComparator:
 
         # startでソート
         notes_info.sort(key=lambda x: (x['start'], x['pitch']))
-        return notes_info
+        return notes_info, midi_obj.ticks_per_beat
 
     def compare_notes(
         self,
         notes1: List[Dict],
-        notes2: List[Dict]
+        notes2: List[Dict],
+        ticks_per_beat1: int = 480,
+        ticks_per_beat2: int = 480
     ) -> Tuple[bool, Dict]:
         """
         2つのノートリストを比較
+
+        Args:
+            notes1: 元のノートリスト
+            notes2: 再構築されたノートリスト
+            ticks_per_beat1: notes1のticks_per_beat
+            ticks_per_beat2: notes2のticks_per_beat
 
         Returns:
             (比較結果, 詳細情報)
@@ -115,7 +135,9 @@ class MIDIComparator:
             'missing_notes': [],
             'extra_notes': [],
             'pitch_errors': [],
-            'velocity_errors': []
+            'velocity_errors': [],
+            'ticks_per_beat_1': ticks_per_beat1,
+            'ticks_per_beat_2': ticks_per_beat2
         }
 
         # 各ノートについてマッチングを試みる
@@ -125,17 +147,27 @@ class MIDIComparator:
             best_match = None
             best_distance = float('inf')
 
+            # ===== 追加: 正規化された位置で比較 =====
+            # 元のticksをbeat単位に正規化
+            note1_normalized_start = note1['start'] / ticks_per_beat1
+            # =========================================
+
             for j, note2 in enumerate(notes2):
                 if j in matched_indices:
                     continue
 
-                # タイミング差を計算
-                start_diff = abs(note2['start'] - note1['start'])
+                # ===== 追加: 正規化された位置で比較 =====
+                note2_normalized_start = note2['start'] / ticks_per_beat2
+                # タイミング差を正規化された単位で計算（beat単位）
+                normalized_diff = abs(note2_normalized_start - note1_normalized_start)
+                # tick単位の許容範囲を正規化単位に変換
+                normalized_tolerance = self.tolerance / ticks_per_beat1
+                # ==========================================
 
                 # ピッチが許容範囲内で一致し、タイミング差が許容範囲内
-                if self.is_pitch_compatible(note1['pitch'], note2['pitch']) and start_diff <= self.tolerance:
-                    if start_diff < best_distance:
-                        best_distance = start_diff
+                if self.is_pitch_compatible(note1['pitch'], note2['pitch']) and normalized_diff <= normalized_tolerance:
+                    if normalized_diff < best_distance:
+                        best_distance = normalized_diff
                         best_match = j
 
             if best_match is not None:
@@ -144,12 +176,13 @@ class MIDIComparator:
 
                 note2 = notes2[best_match]
 
-                # タイミングの誤差を記録
+                # タイミングの誤差を記録（正規化単位）
                 if best_distance > 0:
                     result['timing_errors'].append({
                         'note_index': i,
                         'pitch': note1['pitch'],
-                        'start_diff': best_distance,
+                        'start_diff_normalized': best_distance,  # beat単位
+                        'start_diff_ticks': best_distance * ticks_per_beat1,  # tick単位
                         'original_start': note1['start'],
                         'converted_start': note2['start']
                     })
@@ -236,6 +269,24 @@ def test_round_trip(
 
         # ステップ2: MIDI → トークン変換
         print("\nステップ2: MIDI → トークン列への変換")
+
+        # ===== 追加: 元のMIDI情報を表示 =====
+        original_midi = miditoolkit.MidiFile(midi_path)
+        print(f"  元のMIDI情報:")
+        print(f"    ticks_per_beat: {original_midi.ticks_per_beat}")
+
+        drum_track = None
+        for inst in original_midi.instruments:
+            if inst.is_drum:
+                drum_track = inst
+                break
+
+        if drum_track:
+            print(f"    ドラム音符数: {len(drum_track.notes)}")
+            if drum_track.notes:
+                print(f"    音符範囲: {min(n.start for n in drum_track.notes)} ~ {max(n.end for n in drum_track.notes)} ticks")
+        # =====================================
+
         tokens, bar_positions = tokenizer.midi_to_tokens(midi_path)
         print(f"  ✓ トークン列を生成")
         print(f"  トークン数: {len(tokens)}")
@@ -289,7 +340,15 @@ def test_round_trip(
         reconstructed_midi_path = os.path.join(output_dir, f"{base_name}_reconstructed.mid")
         midi_obj = converter.tokens_to_midi(loaded_tokens, reconstructed_midi_path)
         print(f"  ✓ MIDIファイルを生成: {reconstructed_midi_path}")
-        print(f"  ノート数: {len(midi_obj.instruments[0].notes)}")
+
+        # ===== 追加: 再構築されたMIDI情報を表示 =====
+        print(f"  再構築されたMIDI情報:")
+        print(f"    ticks_per_beat: {midi_obj.ticks_per_beat}")
+        print(f"    ドラム音符数: {len(midi_obj.instruments[0].notes)}")
+        if midi_obj.instruments[0].notes:
+            print(f"    音符範囲: {min(n.start for n in midi_obj.instruments[0].notes)} ~ {max(n.end for n in midi_obj.instruments[0].notes)} ticks")
+        # ==========================================
+
         result['steps']['tokens_to_midi'] = True
         result['reconstructed_midi_path'] = reconstructed_midi_path
 
@@ -297,15 +356,20 @@ def test_round_trip(
         print("\nステップ6: 元のMIDIファイルと復元したMIDIファイルを比較")
         comparator = MIDIComparator(tolerance_ticks=20)
 
-        original_notes = comparator.extract_notes_info(midi_path)
-        reconstructed_notes = comparator.extract_notes_info(reconstructed_midi_path)
+        # ===== 修正: ticks_per_beatも取得 =====
+        original_notes, original_tpb = comparator.extract_notes_info(midi_path)
+        reconstructed_notes, reconstructed_tpb = comparator.extract_notes_info(reconstructed_midi_path)
+        # =====================================
 
-        print(f"  元のノート数: {len(original_notes)}")
-        print(f"  復元後のノート数: {len(reconstructed_notes)}")
+        print(f"  元のノート数: {len(original_notes)} (ticks_per_beat: {original_tpb})")
+        print(f"  復元後のノート数: {len(reconstructed_notes)} (ticks_per_beat: {reconstructed_tpb})")
 
+        # ===== 修正: ticks_per_beatを渡す =====
         is_match, comparison_result = comparator.compare_notes(
-            original_notes, reconstructed_notes
+            original_notes, reconstructed_notes,
+            original_tpb, reconstructed_tpb
         )
+        # ====================================
 
         result['steps']['comparison'] = True
         result['comparison'] = comparison_result
@@ -316,8 +380,18 @@ def test_round_trip(
 
         if comparison_result['timing_errors']:
             print(f"    タイミング誤差: {len(comparison_result['timing_errors'])}件")
-            avg_error = np.mean([e['start_diff'] for e in comparison_result['timing_errors']])
-            print(f"      平均誤差: {avg_error:.2f} ticks")
+            # ===== 修正: 正規化単位での平均誤差を表示 =====
+            avg_error_normalized = np.mean([e['start_diff_normalized'] for e in comparison_result['timing_errors']])
+            avg_error_ticks = np.mean([e['start_diff_ticks'] for e in comparison_result['timing_errors']])
+            print(f"      平均誤差: {avg_error_ticks:.2f} ticks ({avg_error_normalized:.4f} beats)")
+            # ============================================
+
+            # ===== 追加: 最初の5個のタイミング誤差を表示 =====
+            if len(comparison_result['timing_errors']) <= 5:
+                print(f"      詳細:")
+                for err in comparison_result['timing_errors']:
+                    print(f"        - Pitch {err['pitch']}: {err['start_diff_ticks']:.2f} ticks ({err['start_diff_normalized']:.4f} beats)")
+            # ============================================
 
         if comparison_result['velocity_errors']:
             print(f"    ベロシティ誤差: {len(comparison_result['velocity_errors'])}件")
@@ -337,6 +411,24 @@ def test_round_trip(
                 print(f"      - Pitch {note['pitch']}, Start {note['start']}, Vel {note['velocity']}")
             if len(comparison_result['extra_notes']) > 5:
                 print(f"      ... 他 {len(comparison_result['extra_notes']) - 5}件")
+
+        # ===== 追加: 最初の10個のノート位置比較を表示 =====
+        if original_notes and reconstructed_notes:
+            print(f"\n  最初の10個のノート位置比較:")
+            print(f"    {'元 (ticks)':>15} | {'再構築 (ticks)':>15} | {'差 (beats)':>12}")
+            print(f"    {'-'*15}-+-{'-'*15}-+-{'-'*12}")
+
+            for i in range(min(10, len(original_notes), len(reconstructed_notes))):
+                orig_start = original_notes[i]['start']
+                recon_start = reconstructed_notes[i]['start']
+
+                # 正規化後の位置
+                orig_normalized = orig_start / original_tpb
+                recon_normalized = recon_start / reconstructed_tpb
+                diff = abs(orig_normalized - recon_normalized)
+
+                print(f"    {orig_start:>15} | {recon_start:>15} | {diff:>12.4f}")
+        # ==============================================
 
         if is_match:
             print(f"\n  ✓ 往復変換成功: 元のMIDIファイルとほぼ一致")

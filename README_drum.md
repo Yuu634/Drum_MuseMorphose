@@ -12,6 +12,7 @@
 2. **トークンの結合**: `[楽器]_[技法]_[ベロシティ]` の形式で1つのトークンとして扱う
 3. **構造トークン**: `<BAR>`, `<BEAT_1>`～`<BEAT_4>`, `<POS_0>`～`<POS_23>`
 4. **演奏技法の明示**: RIMSHOT, XSTICK, FLAM, ROLL, CHOKE等を独立したトークンとして表現
+5. **テンポトークン（5 BPM刻み）**: `<TEMPO_120>`, `<TEMPO_125>` 等、各小節のテンポを明示的に記録
 
 ## ファイル構成
 
@@ -310,6 +311,89 @@ RuntimeError: CUDA out of memory
 - 学習率が適切か確認してください（`max_lr`, `min_lr`）
 - KLベータのスケジューリングを調整してください（`kl_max_beta`, `kl_cycle_steps`）
 - データセットのサイズが十分か確認してください
+
+## テンポトークン機能に関するFAQ
+
+### テンポトークンとは？
+
+テンポトークン（`<TEMPO_XXX>`形式）は、ドラム譜のテンポを**5 BPM刻みで量子化**して記録するトークンです。
+各小節の開始時に自動的に追加されます。
+
+詳細: [TEMPO_TOKEN_PKL_GUIDE.md](TEMPO_TOKEN_PKL_GUIDE.md)
+
+### テンポトークンの量子化ルール
+
+5 BPM単位で量子化されます：
+
+```
+入力BPM      →  量子化後      →  テンポトークン
+120-124      →  120          →  <TEMPO_120>
+125-129      →  125          →  <TEMPO_125>
+130-134      →  130          →  <TEMPO_130>
+```
+
+**例**:
+- 122 BPM の MIDI → `<TEMPO_120>` (120-124の範囲に対応)
+- 127 BPM の MIDI → `<TEMPO_125>` (125-129の範囲に対応)
+
+### テンポトークンはいつ追加されるか？
+
+`prepare_drum_dataset.py` でデータセットを準備する際に、**自動的に各小節の開始時にテンポトークンが追加**されます。
+
+```bash
+python prepare_drum_dataset.py \
+    --midi_dir /path/to/your/drum/midis \
+    --output_dir ./drum_prepare \
+    --vocab_path ./drum_vocab.pkl
+```
+
+実行後のpklファイルには既にテンポトークンが含まれています。
+
+### テンポトークンが正しく含まれているか確認する方法
+
+[verify_tempo_token_in_pkl.py](verify_tempo_token_in_pkl.py) で検証できます：
+
+```bash
+python verify_tempo_token_in_pkl.py <midi_file> <output_pkl>
+
+# 例
+python verify_tempo_token_in_pkl.py test_token/sample_midis/simple_beat.mid test_output.pkl
+```
+
+出力例：
+```
+✓ ALL CHECKS PASSED - Tempo tokens are correctly integrated!
+```
+
+### 語彙サイズの増加
+
+テンポトークンの追加により、語彙が以下のように増加します：
+
+| 項目 | 数量 |
+|------|------|
+| テンポトークン | 37個 (60, 65, 70, ..., 240 BPM) |
+| その他トークン | ~200個 |
+| **合計語彙サイズ** | **~250個** |
+
+### 旧形式のpklファイルは使用できるか？
+
+テンポトークンなしの旧形式のpklファイルも読み込み可能ですが、テンポ情報が含まれません。
+新しい学習には、テンポトークンを含むpklファイルの使用を推奨します。
+
+### テンポが変わるMIDIには対応しているか？
+
+はい、テンポ変更に対応しています。各小節で現在のテンポを自動検出し、テンポトークンを更新します：
+
+```
+original MIDI:
+  - 0 tick: 120 BPM (小節1-2)
+  - 1000 tick: 130 BPM (小節3以降)
+
+tokenized output:
+  <TEMPO_120> <BAR> ... (小節1)
+  <TEMPO_120> <BAR> ... (小節2)
+  <TEMPO_130> <BAR> ... (小節3)
+```
 
 ## 生成方法（今後の実装）
 
