@@ -12,24 +12,24 @@ POSITIONS_PER_BEAT = 24
 DEFAULT_BPM = 120
 
 # ドラム楽器からMIDIノート番号へのマッピング（逆引き）
-# drum_tokenizer.pyのDRUM_NOTE_MAPと対応させる
+# drum_tokenizer.pyのSTANDARD_PITCH_MAPと対応させる
 DRUM_TO_NOTE = {
-    'KICK': 36,
+    'KICK': 36,            # C2 (MIDI 36)
     'SNARE': 38,           # D2 (MIDI 38)
     'SNARE_ACCENT': 37,    # C#2 (MIDI 37) - Snare accent
-    'SNARE_XSTICK': 39,
-    'SNARE_RIMSHOT': 40,
+    'SNARE_XSTICK': 39,    # G1 (MIDI 39)
+    'SNARE_RIMSHOT': 40,   # E2 (MIDI 40)
     'TOM1': 48,            # C3 (MIDI 48)
     'TOM2': 47,            # B2 (MIDI 47)
     'FLOOR': 43,           # G2 (MIDI 43)
     'HH_CLOSED': 42,       # F#2 (MIDI 42)
-    'HH_HALFOPEN': 44,     # G#2
+    'HH_HALFOPEN': 44,     # G#2 (MIDI 44)
     'HH_OPEN': 46,         # A#2 (MIDI 46)
     'HH_PEDAL': 44,        # G#2 (MIDI 44)
     'RIDE_BOW': 51,        # D#3 (MIDI 51)
-    'RIDE_BELL': 53,
-    'CRASH': 49,
-    'SPLASH': 55,
+    'RIDE_BELL': 53,       # F#3 (MIDI 53)
+    'CRASH': 49,           # C#3 (MIDI 49)
+    'SPLASH': 55,          # G#3 (MIDI 55)
     'CHINA': 52,           # E3 (MIDI 52)
     'TAMBOURINE': 54,      # F#3 (MIDI 54)
     'COWBELL': 56,         # G#3 (MIDI 56)

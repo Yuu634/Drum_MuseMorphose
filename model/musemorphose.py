@@ -50,13 +50,18 @@ class VAETransformerDecoder(nn.Module):
     return out
 
 class MuseMorphose(nn.Module):
-  def __init__(self, enc_n_layer, enc_n_head, enc_d_model, enc_d_ff, 
+  def __init__(self, enc_n_layer, enc_n_head, enc_d_model, enc_d_ff,
     dec_n_layer, dec_n_head, dec_d_model, dec_d_ff,
     d_vae_latent, d_embed, n_token,
     enc_dropout=0.1, enc_activation='relu',
     dec_dropout=0.1, dec_activation='relu',
     d_rfreq_emb=32, d_polyph_emb=32,
     n_rfreq_cls=8, n_polyph_cls=8,
+    # ===== 新規: 5つの難易度埋め込みパラメータ =====
+    d_s_tech_emb=32, d_s_indep_emb=32, d_s_hand_emb=32, d_s_foot_emb=32, d_s_move_emb=32,
+    n_s_tech_cls=8, n_s_indep_cls=8, n_s_hand_cls=8, n_s_foot_cls=8, n_s_move_cls=8,
+    use_difficulty=False,  # 難易度属性を使用するかどうか
+    # ==============================================
     is_training=True, use_attr_cls=True,
     cond_mode='in-attn'
   ):
@@ -78,6 +83,7 @@ class MuseMorphose(nn.Module):
     self.d_vae_latent = d_vae_latent
     self.n_token = n_token
     self.is_training = is_training
+    self.use_difficulty = use_difficulty  # ===== 追加 =====
 
     self.cond_mode = cond_mode
     self.token_emb = TokenEmbedding(n_token, d_embed, enc_d_model)
@@ -89,12 +95,56 @@ class MuseMorphose(nn.Module):
     )
 
     self.use_attr_cls = use_attr_cls
-    if use_attr_cls:
+
+    # ===== 難易度属性を使用する場合 =====
+    if use_attr_cls and use_difficulty:
+      # 5つの難易度埋め込みの合計サイズ
+      total_attr_emb_size = d_s_tech_emb + d_s_indep_emb + d_s_hand_emb + d_s_foot_emb + d_s_move_emb
+
+      self.decoder = VAETransformerDecoder(
+        dec_n_layer, dec_n_head, dec_d_model, dec_d_ff, d_vae_latent + total_attr_emb_size,
+        dropout=dec_dropout, activation=dec_activation,
+        cond_mode=cond_mode
+      )
+
+      # 5つの属性埋め込み層
+      self.d_s_tech_emb = d_s_tech_emb
+      self.d_s_indep_emb = d_s_indep_emb
+      self.d_s_hand_emb = d_s_hand_emb
+      self.d_s_foot_emb = d_s_foot_emb
+      self.d_s_move_emb = d_s_move_emb
+
+      self.s_tech_attr_emb = TokenEmbedding(n_s_tech_cls, d_s_tech_emb, d_s_tech_emb)
+      self.s_indep_attr_emb = TokenEmbedding(n_s_indep_cls, d_s_indep_emb, d_s_indep_emb)
+      self.s_hand_attr_emb = TokenEmbedding(n_s_hand_cls, d_s_hand_emb, d_s_hand_emb)
+      self.s_foot_attr_emb = TokenEmbedding(n_s_foot_cls, d_s_foot_emb, d_s_foot_emb)
+      self.s_move_attr_emb = TokenEmbedding(n_s_move_cls, d_s_move_emb, d_s_move_emb)
+
+      # 従来の属性は使用しない
+      self.rfreq_attr_emb = None
+      self.polyph_attr_emb = None
+
+    # ===== 従来の属性を使用する場合 =====
+    elif use_attr_cls:
       self.decoder = VAETransformerDecoder(
         dec_n_layer, dec_n_head, dec_d_model, dec_d_ff, d_vae_latent + d_polyph_emb + d_rfreq_emb,
         dropout=dec_dropout, activation=dec_activation,
         cond_mode=cond_mode
       )
+
+      self.d_rfreq_emb = d_rfreq_emb
+      self.d_polyph_emb = d_polyph_emb
+      self.rfreq_attr_emb = TokenEmbedding(n_rfreq_cls, d_rfreq_emb, d_rfreq_emb)
+      self.polyph_attr_emb = TokenEmbedding(n_polyph_cls, d_polyph_emb, d_polyph_emb)
+
+      # 難易度属性は使用しない
+      self.s_tech_attr_emb = None
+      self.s_indep_attr_emb = None
+      self.s_hand_attr_emb = None
+      self.s_foot_attr_emb = None
+      self.s_move_attr_emb = None
+
+    # ===== 属性を使用しない場合 =====
     else:
       self.decoder = VAETransformerDecoder(
         dec_n_layer, dec_n_head, dec_d_model, dec_d_ff, d_vae_latent,
@@ -102,14 +152,13 @@ class MuseMorphose(nn.Module):
         cond_mode=cond_mode
       )
 
-    if use_attr_cls:
-      self.d_rfreq_emb = d_rfreq_emb
-      self.d_polyph_emb = d_polyph_emb
-      self.rfreq_attr_emb = TokenEmbedding(n_rfreq_cls, d_rfreq_emb, d_rfreq_emb)
-      self.polyph_attr_emb = TokenEmbedding(n_polyph_cls, d_polyph_emb, d_polyph_emb)
-    else:
       self.rfreq_attr_emb = None
       self.polyph_attr_emb = None
+      self.s_tech_attr_emb = None
+      self.s_indep_attr_emb = None
+      self.s_hand_attr_emb = None
+      self.s_foot_attr_emb = None
+      self.s_move_attr_emb = None
 
     self.emb_dropout = nn.Dropout(self.enc_dropout)
     self.apply(weights_init)
@@ -134,14 +183,33 @@ class MuseMorphose(nn.Module):
 
     return vae_latent
 
-  def generate(self, inp, dec_seg_emb, rfreq_cls=None, polyph_cls=None, keep_last_only=True):
+  def generate(self, inp, dec_seg_emb, rfreq_cls=None, polyph_cls=None,
+               s_tech_cls=None, s_indep_cls=None, s_hand_cls=None, s_foot_cls=None, s_move_cls=None,
+               keep_last_only=True):
     token_emb = self.token_emb(inp)
     dec_inp = self.emb_dropout(token_emb) + self.pe(inp.size(0))
 
-    if rfreq_cls is not None and polyph_cls is not None:
+    # ===== 難易度属性を使用する場合 =====
+    if (self.use_difficulty and s_tech_cls is not None and s_indep_cls is not None and
+        s_hand_cls is not None and s_foot_cls is not None and s_move_cls is not None):
+
+      s_tech_emb = self.s_tech_attr_emb(s_tech_cls)
+      s_indep_emb = self.s_indep_attr_emb(s_indep_cls)
+      s_hand_emb = self.s_hand_attr_emb(s_hand_cls)
+      s_foot_emb = self.s_foot_attr_emb(s_foot_cls)
+      s_move_emb = self.s_move_attr_emb(s_move_cls)
+
+      dec_seg_emb_cat = torch.cat([
+        dec_seg_emb, s_tech_emb, s_indep_emb, s_hand_emb, s_foot_emb, s_move_emb
+      ], dim=-1)
+
+    # ===== 従来の属性を使用する場合 =====
+    elif rfreq_cls is not None and polyph_cls is not None:
       dec_rfreq_emb = self.rfreq_attr_emb(rfreq_cls)
       dec_polyph_emb = self.polyph_attr_emb(polyph_cls)
       dec_seg_emb_cat = torch.cat([dec_seg_emb, dec_rfreq_emb, dec_polyph_emb], dim=-1)
+
+    # ===== 属性を使用しない場合 =====
     else:
       dec_seg_emb_cat = dec_seg_emb
 
@@ -154,13 +222,15 @@ class MuseMorphose(nn.Module):
     return out
 
 
-  def forward(self, enc_inp, dec_inp, dec_inp_bar_pos, rfreq_cls=None, polyph_cls=None, padding_mask=None):
+  def forward(self, enc_inp, dec_inp, dec_inp_bar_pos, rfreq_cls=None, polyph_cls=None,
+              s_tech_cls=None, s_indep_cls=None, s_hand_cls=None, s_foot_cls=None, s_move_cls=None,
+              padding_mask=None):
     # [shape of enc_inp] (seqlen_per_bar, bsize, n_bars_per_sample)
     enc_bt_size, enc_n_bars = enc_inp.size(1), enc_inp.size(2)
     enc_token_emb = self.token_emb(enc_inp)
 
     # [shape of dec_inp] (seqlen_per_sample, bsize)
-    # [shape of rfreq_cls & polyph_cls] same as above 
+    # [shape of rfreq_cls & polyph_cls OR difficulty classes] same as above
     # -- (should copy each bar's label to all corresponding indices)
     dec_token_emb = self.token_emb(dec_inp)
 
@@ -186,10 +256,28 @@ class MuseMorphose(nn.Module):
       for b, (st, ed) in enumerate(zip(dec_inp_bar_pos[n, :-1], dec_inp_bar_pos[n, 1:])):
         dec_seg_emb[st:ed, n, :] = vae_latent_reshaped[n, b, :]
 
-    if rfreq_cls is not None and polyph_cls is not None and self.use_attr_cls:
+    # ===== 難易度属性を使用する場合 =====
+    if (self.use_difficulty and s_tech_cls is not None and s_indep_cls is not None and
+        s_hand_cls is not None and s_foot_cls is not None and s_move_cls is not None and
+        self.use_attr_cls):
+
+      s_tech_emb = self.s_tech_attr_emb(s_tech_cls)
+      s_indep_emb = self.s_indep_attr_emb(s_indep_cls)
+      s_hand_emb = self.s_hand_attr_emb(s_hand_cls)
+      s_foot_emb = self.s_foot_attr_emb(s_foot_cls)
+      s_move_emb = self.s_move_attr_emb(s_move_cls)
+
+      dec_seg_emb_cat = torch.cat([
+        dec_seg_emb, s_tech_emb, s_indep_emb, s_hand_emb, s_foot_emb, s_move_emb
+      ], dim=-1)
+
+    # ===== 従来の属性を使用する場合 =====
+    elif rfreq_cls is not None and polyph_cls is not None and self.use_attr_cls:
       dec_rfreq_emb = self.rfreq_attr_emb(rfreq_cls)
       dec_polyph_emb = self.polyph_attr_emb(polyph_cls)
       dec_seg_emb_cat = torch.cat([dec_seg_emb, dec_rfreq_emb, dec_polyph_emb], dim=-1)
+
+    # ===== 属性を使用しない場合 =====
     else:
       dec_seg_emb_cat = dec_seg_emb
 

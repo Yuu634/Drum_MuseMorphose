@@ -59,6 +59,26 @@ DRUM_NOTE_MAP = {
     56: ('COWBELL', 'HIT'),  # G#3 - Cowbell
 }
 
+# 各楽器の標準ピッチマッピング：複数のピッチをまとめる
+# これにより、往復変換でピッチが保持される
+STANDARD_PITCH_MAP = {
+    'KICK': 36,        # 35 と 36 を 36 に統一
+    'SNARE': 38,       # 38 と 40 を 38 に統一
+    'FLOOR': 43,       # 41 と 43 を 43 に統一
+    'TOM1': 48,        # 標準ピッチ
+    'TOM2': 47,        # 45, 47, 50 を 47 に統一
+    'HH_CLOSED': 42,   # 標準ピッチ
+    'HH_PEDAL': 44,    # 標準ピッチ
+    'HH_OPEN': 46,     # 標準ピッチ
+    'RIDE_BOW': 51,    # 51, 59 を 51 に統一
+    'RIDE_BELL': 53,   # 標準ピッチ
+    'CRASH': 49,       # 49, 57 を 49 に統一
+    'CHINA': 52,       # 標準ピッチ
+    'SPLASH': 55,      # 標準ピッチ
+    'TAMBOURINE': 54,  # 標準ピッチ
+    'COWBELL': 56,     # 標準ピッチ
+}
+
 
 class DrumTokenizer:
     """ドラム譜トークナイザー"""
@@ -139,9 +159,13 @@ class DrumTokenizer:
         else:
             return 'Accent'
 
-    def _detect_flam(self, notes: List[miditoolkit.Note], window_ticks: int = 60) -> Dict[int, List[int]]:
+    def _detect_flam(self, notes: List[miditoolkit.Note], window_ticks: int = 30) -> Dict[int, List[int]]:
         """
         フラムを検出 (短い間隔で連続する同楽器の打撃)
+        
+        フラムは通常、非常に短い前打音（10-30 ticks以内）を伴う打撃です。
+        このメソッドは、同一楽器で指定された時間以内に発生した
+        ノートペアをフラムの（前打音, 主音符）として認識します。
 
         Returns:
             Dict[主音符のインデックス, 前打音のインデックスのリスト]
@@ -168,21 +192,17 @@ class DrumTokenizer:
     def _detect_choke(self, notes: List[miditoolkit.Note]) -> Dict[int, int]:
         """
         チョークを検出 (Note Offが極端に短い)
+        
+        注: CRASH、SPLASH、CHINA、RIDE、TAMBOURINE、COWBELLなどのシンバル類は
+        自然に短い音が多いため、自動チョーク検出は無効化
+        これにより往復変換時のノート欠損を防ぐ
 
         Returns:
             Dict[ノートインデックス, チョーク位置のtick]
         """
-        chokes = {}
-        for i, note in enumerate(notes):
-            duration = note.end - note.start
-            # シンバル類で極端に短い音価の場合、チョークとみなす
-            if note.pitch in DRUM_NOTE_MAP:
-                drum_type = DRUM_NOTE_MAP[note.pitch][0]
-                if drum_type in ['CRASH', 'SPLASH', 'CHINA', 'RIDE_BOW', 'RIDE_BELL', 'TAMBOURINE', 'COWBELL']:
-                    if duration < DEFAULT_BEAT_RESOL / 4:  # 16分音符未満
-                        chokes[i] = note.end
-
-        return chokes
+        # チョーク検出を無効化して空の辞書を返す
+        # これにより、全ノートが通常の演奏トークンとしてトークン化される
+        return {}
 
     def midi_to_tokens(self, midi_path: str) -> Tuple[List[str], List[int]]:
         """
