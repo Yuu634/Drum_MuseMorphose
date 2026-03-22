@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from transformer_encoder import VAETransformerEncoder
 from transformer_helpers import (
-  weights_init, PositionalEncoding, TokenEmbedding, generate_causal_mask
+  weights_init, PositionalEncoding, TokenEmbedding, CpCompositeEmbedding, generate_causal_mask
 )
 
 class VAETransformerDecoder(nn.Module):
@@ -61,6 +61,17 @@ class MuseMorphose(nn.Module):
     d_s_tech_emb=32, d_s_indep_emb=32, d_s_hand_emb=32, d_s_foot_emb=32, d_s_move_emb=32,
     n_s_tech_cls=8, n_s_indep_cls=8, n_s_hand_cls=8, n_s_foot_cls=8, n_s_move_cls=8,
     use_difficulty=False,  # 難易度属性を使用するかどうか
+    tokenization_method='standard',
+    cp_event_type_vocab_size=3,
+    cp_struct_vocab_size=None,
+    cp_pos_vocab_size=25,
+    cp_limb_vocab_size=2,
+    cp_event_pad_idx=2,
+    cp_struct_pad_idx=0,
+    cp_pos_pad_idx=24,
+    cp_limb_pad_idx=0,
+    d_cp_pos_emb=64,
+    d_cp_limb_emb=64,
     # ==============================================
     is_training=True, use_attr_cls=True,
     cond_mode='in-attn'
@@ -84,6 +95,7 @@ class MuseMorphose(nn.Module):
     self.n_token = n_token
     self.is_training = is_training
     self.use_difficulty = use_difficulty  # ===== 追加 =====
+    self.tokenization_method = tokenization_method
 
     self.cond_mode = cond_mode
     self.token_emb = TokenEmbedding(n_token, d_embed, enc_d_model)
@@ -95,6 +107,15 @@ class MuseMorphose(nn.Module):
     )
 
     self.use_attr_cls = use_attr_cls
+
+    self.cp_event_type_vocab_size = cp_event_type_vocab_size
+    self.cp_struct_vocab_size = cp_struct_vocab_size if cp_struct_vocab_size is not None else n_token
+    self.cp_pos_vocab_size = cp_pos_vocab_size
+    self.cp_limb_vocab_size = cp_limb_vocab_size
+    self.cp_event_pad_idx = cp_event_pad_idx
+    self.cp_struct_pad_idx = cp_struct_pad_idx
+    self.cp_pos_pad_idx = cp_pos_pad_idx
+    self.cp_limb_pad_idx = cp_limb_pad_idx
 
     # ===== 難易度属性を使用する場合 =====
     if use_attr_cls and use_difficulty:
@@ -161,6 +182,33 @@ class MuseMorphose(nn.Module):
       self.s_move_attr_emb = None
 
     self.emb_dropout = nn.Dropout(self.enc_dropout)
+
+    # ===== CP方式の埋め込み/出力ヘッド =====
+    if self.tokenization_method == 'cp_limb_v1':
+      self.cp_composite_emb = CpCompositeEmbedding(
+        n_pos=self.cp_pos_vocab_size,
+        n_limb_token=self.cp_limb_vocab_size,
+        d_pos=d_cp_pos_emb,
+        d_limb=d_cp_limb_emb,
+        d_proj=enc_d_model
+      )
+      self.cp_event_type_head = nn.Linear(dec_d_model, self.cp_event_type_vocab_size)
+      self.cp_struct_head = nn.Linear(dec_d_model, self.cp_struct_vocab_size)
+      self.cp_pos_head = nn.Linear(dec_d_model, self.cp_pos_vocab_size)
+      self.cp_hand1_head = nn.Linear(dec_d_model, self.cp_limb_vocab_size)
+      self.cp_hand2_head = nn.Linear(dec_d_model, self.cp_limb_vocab_size)
+      self.cp_right_foot_head = nn.Linear(dec_d_model, self.cp_limb_vocab_size)
+      self.cp_left_foot_head = nn.Linear(dec_d_model, self.cp_limb_vocab_size)
+    else:
+      self.cp_composite_emb = None
+      self.cp_event_type_head = None
+      self.cp_struct_head = None
+      self.cp_pos_head = None
+      self.cp_hand1_head = None
+      self.cp_hand2_head = None
+      self.cp_right_foot_head = None
+      self.cp_left_foot_head = None
+
     self.apply(weights_init)
     
 
@@ -185,34 +233,54 @@ class MuseMorphose(nn.Module):
 
   def generate(self, inp, dec_seg_emb, rfreq_cls=None, polyph_cls=None,
                s_tech_cls=None, s_indep_cls=None, s_hand_cls=None, s_foot_cls=None, s_move_cls=None,
+               cp_event_type_inp=None, cp_struct_inp=None,
+               cp_pos_inp=None, cp_hand1_inp=None, cp_hand2_inp=None,
+               cp_right_foot_inp=None, cp_left_foot_inp=None,
                keep_last_only=True):
+    dec_seg_emb_cat = self._build_conditional_seg_emb(
+      dec_seg_emb,
+      rfreq_cls=rfreq_cls,
+      polyph_cls=polyph_cls,
+      s_tech_cls=s_tech_cls,
+      s_indep_cls=s_indep_cls,
+      s_hand_cls=s_hand_cls,
+      s_foot_cls=s_foot_cls,
+      s_move_cls=s_move_cls
+    )
+
+    if self.tokenization_method == 'cp_limb_v1':
+      if cp_event_type_inp is None:
+        raise ValueError('cp_event_type_inp is required when tokenization_method=cp_limb_v1')
+
+      if cp_struct_inp is None:
+        cp_struct_inp = inp
+
+      struct_token_emb = self.token_emb(cp_struct_inp)
+      cp_token_emb = self.cp_composite_emb(
+        cp_pos_inp, cp_hand1_inp, cp_hand2_inp, cp_right_foot_inp, cp_left_foot_inp
+      )
+
+      cp_mask = (cp_event_type_inp == 1).unsqueeze(-1)
+      dec_token_emb = torch.where(cp_mask, cp_token_emb, struct_token_emb)
+      dec_inp = self.emb_dropout(dec_token_emb) + self.pe(inp.size(0))
+
+      dec_out = self.decoder(dec_inp, dec_seg_emb_cat)
+      cp_logits = {
+        'event_type': self.cp_event_type_head(dec_out),
+        'structural': self.cp_struct_head(dec_out),
+        'cp_pos': self.cp_pos_head(dec_out),
+        'cp_hand1': self.cp_hand1_head(dec_out),
+        'cp_hand2': self.cp_hand2_head(dec_out),
+        'cp_right_foot': self.cp_right_foot_head(dec_out),
+        'cp_left_foot': self.cp_left_foot_head(dec_out),
+      }
+
+      if keep_last_only:
+        cp_logits = {k: v[-1, ...] for k, v in cp_logits.items()}
+      return cp_logits
+
     token_emb = self.token_emb(inp)
     dec_inp = self.emb_dropout(token_emb) + self.pe(inp.size(0))
-
-    # ===== 難易度属性を使用する場合 =====
-    if (self.use_difficulty and s_tech_cls is not None and s_indep_cls is not None and
-        s_hand_cls is not None and s_foot_cls is not None and s_move_cls is not None):
-
-      s_tech_emb = self.s_tech_attr_emb(s_tech_cls)
-      s_indep_emb = self.s_indep_attr_emb(s_indep_cls)
-      s_hand_emb = self.s_hand_attr_emb(s_hand_cls)
-      s_foot_emb = self.s_foot_attr_emb(s_foot_cls)
-      s_move_emb = self.s_move_attr_emb(s_move_cls)
-
-      dec_seg_emb_cat = torch.cat([
-        dec_seg_emb, s_tech_emb, s_indep_emb, s_hand_emb, s_foot_emb, s_move_emb
-      ], dim=-1)
-
-    # ===== 従来の属性を使用する場合 =====
-    elif rfreq_cls is not None and polyph_cls is not None:
-      dec_rfreq_emb = self.rfreq_attr_emb(rfreq_cls)
-      dec_polyph_emb = self.polyph_attr_emb(polyph_cls)
-      dec_seg_emb_cat = torch.cat([dec_seg_emb, dec_rfreq_emb, dec_polyph_emb], dim=-1)
-
-    # ===== 属性を使用しない場合 =====
-    else:
-      dec_seg_emb_cat = dec_seg_emb
-
     out = self.decoder(dec_inp, dec_seg_emb_cat)
     out = self.dec_out_proj(out)
 
@@ -222,8 +290,54 @@ class MuseMorphose(nn.Module):
     return out
 
 
+  def _build_dec_seg_emb(self, dec_inp, dec_inp_bar_pos, vae_latent):
+    enc_bt_size = dec_inp_bar_pos.size(0)
+    enc_n_bars = dec_inp_bar_pos.size(1) - 1
+    vae_latent_reshaped = vae_latent.reshape(enc_bt_size, enc_n_bars, -1)
+
+    dec_seg_emb = torch.zeros(dec_inp.size(0), dec_inp.size(1), self.d_vae_latent).to(vae_latent.device)
+    for n in range(dec_inp.size(1)):
+      for b, (st, ed) in enumerate(zip(dec_inp_bar_pos[n, :-1], dec_inp_bar_pos[n, 1:])):
+        dec_seg_emb[st:ed, n, :] = vae_latent_reshaped[n, b, :]
+    return dec_seg_emb
+
+  def _build_conditional_seg_emb(
+    self,
+    dec_seg_emb,
+    rfreq_cls=None,
+    polyph_cls=None,
+    s_tech_cls=None,
+    s_indep_cls=None,
+    s_hand_cls=None,
+    s_foot_cls=None,
+    s_move_cls=None
+  ):
+    if (self.use_difficulty and s_tech_cls is not None and s_indep_cls is not None and
+        s_hand_cls is not None and s_foot_cls is not None and s_move_cls is not None and
+        self.use_attr_cls):
+
+      s_tech_emb = self.s_tech_attr_emb(s_tech_cls)
+      s_indep_emb = self.s_indep_attr_emb(s_indep_cls)
+      s_hand_emb = self.s_hand_attr_emb(s_hand_cls)
+      s_foot_emb = self.s_foot_attr_emb(s_foot_cls)
+      s_move_emb = self.s_move_attr_emb(s_move_cls)
+
+      return torch.cat([
+        dec_seg_emb, s_tech_emb, s_indep_emb, s_hand_emb, s_foot_emb, s_move_emb
+      ], dim=-1)
+
+    if rfreq_cls is not None and polyph_cls is not None and self.use_attr_cls:
+      dec_rfreq_emb = self.rfreq_attr_emb(rfreq_cls)
+      dec_polyph_emb = self.polyph_attr_emb(polyph_cls)
+      return torch.cat([dec_seg_emb, dec_rfreq_emb, dec_polyph_emb], dim=-1)
+
+    return dec_seg_emb
+
   def forward(self, enc_inp, dec_inp, dec_inp_bar_pos, rfreq_cls=None, polyph_cls=None,
               s_tech_cls=None, s_indep_cls=None, s_hand_cls=None, s_foot_cls=None, s_move_cls=None,
+              cp_event_type_inp=None, cp_struct_inp=None,
+              cp_pos_inp=None, cp_hand1_inp=None, cp_hand2_inp=None,
+              cp_right_foot_inp=None, cp_left_foot_inp=None,
               padding_mask=None):
     # [shape of enc_inp] (seqlen_per_bar, bsize, n_bars_per_sample)
     enc_bt_size, enc_n_bars = enc_inp.size(1), enc_inp.size(2)
@@ -247,39 +361,45 @@ class MuseMorphose(nn.Module):
 
     _, mu, logvar = self.encoder(enc_inp, padding_mask=padding_mask)
     vae_latent = self.reparameterize(mu, logvar)
-    vae_latent_reshaped = vae_latent.reshape(enc_bt_size, enc_n_bars, -1)
+    dec_seg_emb = self._build_dec_seg_emb(dec_inp, dec_inp_bar_pos, vae_latent)
+    dec_seg_emb_cat = self._build_conditional_seg_emb(
+      dec_seg_emb,
+      rfreq_cls=rfreq_cls,
+      polyph_cls=polyph_cls,
+      s_tech_cls=s_tech_cls,
+      s_indep_cls=s_indep_cls,
+      s_hand_cls=s_hand_cls,
+      s_foot_cls=s_foot_cls,
+      s_move_cls=s_move_cls
+    )
 
-    dec_seg_emb = torch.zeros(dec_inp.size(0), dec_inp.size(1), self.d_vae_latent).to(vae_latent.device)
-    for n in range(dec_inp.size(1)):
-      # [shape of dec_inp_bar_pos] (bsize, n_bars_per_sample + 1)
-      # -- stores [[start idx of bar #1, sample #1, ..., start idx of bar #K, sample #1, seqlen of sample #1], [same for another sample], ...]
-      for b, (st, ed) in enumerate(zip(dec_inp_bar_pos[n, :-1], dec_inp_bar_pos[n, 1:])):
-        dec_seg_emb[st:ed, n, :] = vae_latent_reshaped[n, b, :]
+    if self.tokenization_method == 'cp_limb_v1':
+      if cp_struct_inp is None:
+        cp_struct_inp = dec_inp
 
-    # ===== 難易度属性を使用する場合 =====
-    if (self.use_difficulty and s_tech_cls is not None and s_indep_cls is not None and
-        s_hand_cls is not None and s_foot_cls is not None and s_move_cls is not None and
-        self.use_attr_cls):
+      if cp_event_type_inp is None:
+        raise ValueError('cp_event_type_inp is required when tokenization_method=cp_limb_v1')
 
-      s_tech_emb = self.s_tech_attr_emb(s_tech_cls)
-      s_indep_emb = self.s_indep_attr_emb(s_indep_cls)
-      s_hand_emb = self.s_hand_attr_emb(s_hand_cls)
-      s_foot_emb = self.s_foot_attr_emb(s_foot_cls)
-      s_move_emb = self.s_move_attr_emb(s_move_cls)
+      struct_token_emb = self.token_emb(cp_struct_inp)
+      cp_token_emb = self.cp_composite_emb(
+        cp_pos_inp, cp_hand1_inp, cp_hand2_inp, cp_right_foot_inp, cp_left_foot_inp
+      )
 
-      dec_seg_emb_cat = torch.cat([
-        dec_seg_emb, s_tech_emb, s_indep_emb, s_hand_emb, s_foot_emb, s_move_emb
-      ], dim=-1)
+      cp_mask = (cp_event_type_inp == 1).unsqueeze(-1)
+      dec_token_emb = torch.where(cp_mask, cp_token_emb, struct_token_emb)
+      dec_inp_emb = self.emb_dropout(dec_token_emb) + self.pe(dec_inp.size(0))
 
-    # ===== 従来の属性を使用する場合 =====
-    elif rfreq_cls is not None and polyph_cls is not None and self.use_attr_cls:
-      dec_rfreq_emb = self.rfreq_attr_emb(rfreq_cls)
-      dec_polyph_emb = self.polyph_attr_emb(polyph_cls)
-      dec_seg_emb_cat = torch.cat([dec_seg_emb, dec_rfreq_emb, dec_polyph_emb], dim=-1)
-
-    # ===== 属性を使用しない場合 =====
-    else:
-      dec_seg_emb_cat = dec_seg_emb
+      dec_out = self.decoder(dec_inp_emb, dec_seg_emb_cat)
+      cp_logits = {
+        'event_type': self.cp_event_type_head(dec_out),
+        'structural': self.cp_struct_head(dec_out),
+        'cp_pos': self.cp_pos_head(dec_out),
+        'cp_hand1': self.cp_hand1_head(dec_out),
+        'cp_hand2': self.cp_hand2_head(dec_out),
+        'cp_right_foot': self.cp_right_foot_head(dec_out),
+        'cp_left_foot': self.cp_left_foot_head(dec_out),
+      }
+      return mu, logvar, cp_logits
 
     dec_out = self.decoder(dec_inp, dec_seg_emb_cat)
     dec_logits = self.dec_out_proj(dec_out)
@@ -303,4 +423,80 @@ class MuseMorphose(nn.Module):
       'kldiv_loss': kldiv_loss,
       'kldiv_raw': kl_before_free_bits,
       'recons_loss': recons_loss
+    }
+
+  def _masked_ce(self, logits, targets, mask):
+    if mask is None:
+      return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.contiguous().view(-1), reduction='mean')
+
+    if mask.dtype != torch.bool:
+      mask = mask.bool()
+
+    if mask.dim() > 1:
+      mask_flat = mask.view(-1)
+    else:
+      mask_flat = mask
+
+    logits_flat = logits.view(-1, logits.size(-1))
+    targets_flat = targets.contiguous().view(-1)
+
+    if mask_flat.sum() == 0:
+      return logits_flat.new_tensor(0.0)
+
+    logits_sel = logits_flat[mask_flat]
+    targets_sel = targets_flat[mask_flat]
+    return F.cross_entropy(logits_sel, targets_sel, reduction='mean')
+
+  def compute_cp_loss(self, mu, logvar, beta, fb_lambda, cp_logits, cp_targets, loss_weights=None):
+    if loss_weights is None:
+      loss_weights = {}
+
+    event_tgt = cp_targets['event_type']
+    struct_tgt = cp_targets['structural']
+    pos_tgt = cp_targets['cp_pos']
+    h1_tgt = cp_targets['cp_hand1']
+    h2_tgt = cp_targets['cp_hand2']
+    rf_tgt = cp_targets['cp_right_foot']
+    lf_tgt = cp_targets['cp_left_foot']
+
+    event_valid = event_tgt != self.cp_event_pad_idx
+    struct_mask = (event_tgt == 0) & event_valid
+    cp_mask = (event_tgt == 1) & event_valid
+
+    loss_event = self._masked_ce(cp_logits['event_type'], event_tgt, event_valid)
+    loss_struct = self._masked_ce(cp_logits['structural'], struct_tgt, struct_mask)
+    loss_pos = self._masked_ce(cp_logits['cp_pos'], pos_tgt, cp_mask)
+    loss_h1 = self._masked_ce(cp_logits['cp_hand1'], h1_tgt, cp_mask)
+    loss_h2 = self._masked_ce(cp_logits['cp_hand2'], h2_tgt, cp_mask)
+    loss_rf = self._masked_ce(cp_logits['cp_right_foot'], rf_tgt, cp_mask)
+    loss_lf = self._masked_ce(cp_logits['cp_left_foot'], lf_tgt, cp_mask)
+
+    recons_loss = (
+      loss_weights.get('event_type', 1.0) * loss_event +
+      loss_weights.get('structural', 1.0) * loss_struct +
+      loss_weights.get('cp_pos', 1.0) * loss_pos +
+      loss_weights.get('cp_hand1', 1.0) * loss_h1 +
+      loss_weights.get('cp_hand2', 1.0) * loss_h2 +
+      loss_weights.get('cp_right_foot', 1.0) * loss_rf +
+      loss_weights.get('cp_left_foot', 1.0) * loss_lf
+    )
+
+    kl_raw = -0.5 * (1 + logvar - mu ** 2 - logvar.exp()).mean(dim=0)
+    kl_before_free_bits = kl_raw.mean()
+    kl_after_free_bits = kl_raw.clamp(min=fb_lambda)
+    kldiv_loss = kl_after_free_bits.mean()
+
+    return {
+      'beta': beta,
+      'total_loss': recons_loss + beta * kldiv_loss,
+      'kldiv_loss': kldiv_loss,
+      'kldiv_raw': kl_before_free_bits,
+      'recons_loss': recons_loss,
+      'cp_event_type_loss': loss_event,
+      'cp_structural_loss': loss_struct,
+      'cp_pos_loss': loss_pos,
+      'cp_hand1_loss': loss_h1,
+      'cp_hand2_loss': loss_h2,
+      'cp_right_foot_loss': loss_rf,
+      'cp_left_foot_loss': loss_lf,
     }

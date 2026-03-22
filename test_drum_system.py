@@ -76,6 +76,34 @@ def test_tokenizer():
         return False
 
 
+def test_cp_tokenizer():
+    """CPトークナイザーのテスト"""
+    print("\n" + "=" * 60)
+    print("CPトークナイザーのテスト")
+    print("=" * 60)
+
+    try:
+        from drum_cp_tokenizer import DrumCPTokenizer
+
+        tokenizer = DrumCPTokenizer()
+        print("✓ CPトークナイザーの初期化成功")
+        print(f"  EventType語彙サイズ: {len(tokenizer.event_type2idx)}")
+        print(f"  Structural語彙サイズ: {len(tokenizer.struct_token2idx)}")
+        print(f"  Limb語彙サイズ: {len(tokenizer.limb_token2idx)}")
+
+        vocab_path = '/tmp/test_drum_cp_vocab.pkl'
+        tokenizer.save_vocab(vocab_path)
+        print(f"✓ テストCP語彙ファイルを保存: {vocab_path}")
+
+        return True
+
+    except Exception as e:
+        print(f"✗ CPトークナイザーのテスト失敗: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def test_token_to_midi():
     """トークンからMIDIへの変換をテスト"""
     print("\n" + "=" * 60)
@@ -139,6 +167,101 @@ def test_dataloader_imports():
         return False
 
 
+def test_cp_model_smoke():
+    """CPモデルの前向き/損失計算スモークテスト"""
+    print("\n" + "=" * 60)
+    print("CPモデルスモークテスト")
+    print("=" * 60)
+
+    try:
+        import torch
+        from model.musemorphose import MuseMorphose
+
+        bsz = 2
+        n_bars = 4
+        enc_len = 16
+        dec_len = 32
+
+        model = MuseMorphose(
+            enc_n_layer=2,
+            enc_n_head=2,
+            enc_d_model=64,
+            enc_d_ff=128,
+            dec_n_layer=2,
+            dec_n_head=2,
+            dec_d_model=64,
+            dec_d_ff=128,
+            d_vae_latent=64,
+            d_embed=64,
+            n_token=32,
+            tokenization_method='cp_limb_v1',
+            cp_event_type_vocab_size=3,
+            cp_struct_vocab_size=32,
+            cp_pos_vocab_size=25,
+            cp_limb_vocab_size=40,
+            cp_event_pad_idx=2,
+            cp_struct_pad_idx=0,
+            cp_pos_pad_idx=24,
+            cp_limb_pad_idx=0,
+            use_attr_cls=False,
+            cond_mode='in-attn'
+        )
+
+        enc_inp = torch.randint(0, 31, (enc_len, bsz, n_bars))
+        dec_inp = torch.randint(0, 31, (dec_len, bsz))
+        bar_pos = torch.tensor([[0, 8, 16, 24, 32], [0, 8, 16, 24, 32]], dtype=torch.long)
+        padding_mask = torch.zeros((bsz, n_bars, enc_len), dtype=torch.bool)
+
+        cp_event_type_inp = torch.randint(0, 2, (dec_len, bsz))
+        cp_struct_inp = torch.randint(0, 31, (dec_len, bsz))
+        cp_pos_inp = torch.randint(0, 24, (dec_len, bsz))
+        cp_h1_inp = torch.randint(0, 39, (dec_len, bsz))
+        cp_h2_inp = torch.randint(0, 39, (dec_len, bsz))
+        cp_rf_inp = torch.randint(0, 39, (dec_len, bsz))
+        cp_lf_inp = torch.randint(0, 39, (dec_len, bsz))
+
+        mu, logvar, cp_logits = model(
+            enc_inp,
+            dec_inp,
+            bar_pos,
+            cp_event_type_inp=cp_event_type_inp,
+            cp_struct_inp=cp_struct_inp,
+            cp_pos_inp=cp_pos_inp,
+            cp_hand1_inp=cp_h1_inp,
+            cp_hand2_inp=cp_h2_inp,
+            cp_right_foot_inp=cp_rf_inp,
+            cp_left_foot_inp=cp_lf_inp,
+            padding_mask=padding_mask,
+        )
+
+        losses = model.compute_cp_loss(
+            mu,
+            logvar,
+            0.1,
+            0.0,
+            cp_logits,
+            {
+                'event_type': cp_event_type_inp,
+                'structural': cp_struct_inp,
+                'cp_pos': cp_pos_inp,
+                'cp_hand1': cp_h1_inp,
+                'cp_hand2': cp_h2_inp,
+                'cp_right_foot': cp_rf_inp,
+                'cp_left_foot': cp_lf_inp,
+            },
+        )
+
+        print(f"✓ CPモデル前向き成功: logits keys = {list(cp_logits.keys())}")
+        print(f"✓ CP損失計算成功: total_loss = {losses['total_loss'].item():.4f}")
+        return True
+
+    except Exception as e:
+        print(f"✗ CPモデルスモークテスト失敗: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def main():
     """メインテスト関数"""
     print("\nドラム譜MuseMorphose - システムテスト\n")
@@ -153,6 +276,12 @@ def main():
 
     # Token to MIDI 変換のテスト
     results.append(("Token→MIDI変換", test_token_to_midi()))
+
+    # CPトークナイザーのテスト
+    results.append(("CPトークナイザー", test_cp_tokenizer()))
+
+    # CPモデルのスモークテスト
+    results.append(("CPモデルスモーク", test_cp_model_smoke()))
 
     # データローダーのインポートテスト
     results.append(("データローダー", test_dataloader_imports()))

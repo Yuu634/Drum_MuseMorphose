@@ -327,6 +327,48 @@ def tokens_to_midi(
     return converter.tokens_to_midi(tokens, output_path, bpm)
 
 
+def cp_events_to_tokens(cp_data: dict, idx2struct_token: dict, idx2limb_token: dict) -> List[str]:
+    """CPイベント系列を既存トークン列に復元する。"""
+    tokens: List[str] = []
+
+    for ev_type, struct_id, pos_id, h1, h2, rf, lf in zip(
+        cp_data['event_type'],
+        cp_data['struct_token'],
+        cp_data['cp_pos'],
+        cp_data['cp_hand1'],
+        cp_data['cp_hand2'],
+        cp_data['cp_right_foot'],
+        cp_data['cp_left_foot'],
+    ):
+        if int(ev_type) == 0:
+            st = idx2struct_token.get(int(struct_id), '<PAD>')
+            if st != '<PAD>':
+                tokens.append(st)
+            continue
+
+        if int(pos_id) < POSITIONS_PER_BEAT:
+            tokens.append(f'<POS_{int(pos_id)}>')
+
+        for limb_id in (h1, h2, rf, lf):
+            limb_token = idx2limb_token.get(int(limb_id), '<PAD>')
+            if limb_token not in ('<PAD>', '<NONE>'):
+                tokens.append(limb_token)
+
+    return tokens
+
+
+def cp_data_to_midi(
+    cp_data: dict,
+    idx2struct_token: dict,
+    idx2limb_token: dict,
+    output_path: str,
+    bpm: Optional[int] = None
+) -> miditoolkit.MidiFile:
+    """CPデータからMIDIを生成するユーティリティ。"""
+    tokens = cp_events_to_tokens(cp_data, idx2struct_token, idx2limb_token)
+    return tokens_to_midi(tokens, output_path, bpm=bpm)
+
+
 if __name__ == '__main__':
     # テスト用
     test_tokens = [

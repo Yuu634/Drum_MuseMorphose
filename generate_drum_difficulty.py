@@ -294,6 +294,11 @@ if __name__ == "__main__":
     # 設定を読み込み
     config = yaml.load(open(config_path, 'r'), Loader=yaml.FullLoader)
     device = config['training']['device']
+    if config['data'].get('tokenization_method', 'standard') == 'cp_limb_v1':
+        raise NotImplementedError(
+            'generate_drum_difficulty.py is standard-tokenization oriented. '
+            'Use a dedicated CP generation path for cp_limb_v1.'
+        )
 
     # データセット読み込み
     print('[info] Loading dataset...')
@@ -305,7 +310,8 @@ if __name__ == "__main__":
         model_max_bars=config['generate']['max_bars'],
         pieces=pickle_load(config['data']['test_split']),
         pad_to_same=False,
-        use_difficulty=True
+        use_difficulty=True,
+        tokenization_method=config['data'].get('tokenization_method', 'standard')
     )
 
     print(f'[info] Dataset size: {len(dset)} pieces')

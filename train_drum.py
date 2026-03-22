@@ -77,6 +77,9 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched, config, traine
     log_interval = config['training']['log_interval']
     val_interval = config['training']['val_interval']
     use_amp = config['training'].get('use_amp', False) and device == 'cuda'
+    use_difficulty = config['model'].get('use_difficulty', False)
+    tokenization_method = config['data'].get('tokenization_method', 'standard')
+    cp_loss_weights = config['model'].get('cp_loss_weights', {})
 
     params_dir = os.path.join(ckpt_dir, 'params/')
     optim_dir = os.path.join(ckpt_dir, 'optim/')
@@ -101,20 +104,69 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched, config, traine
         batch_inp_lens = batch_samples['length']
         batch_padding_mask = batch_samples['enc_padding_mask'].to(device)
 
+        cp_event_type_inp = batch_samples['cp_event_type_input'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+        cp_struct_inp = batch_samples['cp_struct_input'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+        cp_pos_inp = batch_samples['cp_pos_input'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+        cp_hand1_inp = batch_samples['cp_hand1_input'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+        cp_hand2_inp = batch_samples['cp_hand2_input'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+        cp_rf_inp = batch_samples['cp_right_foot_input'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+        cp_lf_inp = batch_samples['cp_left_foot_input'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+
+        cp_event_type_tgt = batch_samples['cp_event_type_target'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+        cp_struct_tgt = batch_samples['cp_struct_target'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+        cp_pos_tgt = batch_samples['cp_pos_target'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+        cp_hand1_tgt = batch_samples['cp_hand1_target'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+        cp_hand2_tgt = batch_samples['cp_hand2_target'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+        cp_rf_tgt = batch_samples['cp_right_foot_target'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+        cp_lf_tgt = batch_samples['cp_left_foot_target'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+
+        s_tech_cls_seq = batch_samples['s_tech_cls_seq'].permute(1, 0).to(device) if use_difficulty and 's_tech_cls_seq' in batch_samples else None
+        s_indep_cls_seq = batch_samples['s_indep_cls_seq'].permute(1, 0).to(device) if use_difficulty and 's_indep_cls_seq' in batch_samples else None
+        s_hand_cls_seq = batch_samples['s_hand_cls_seq'].permute(1, 0).to(device) if use_difficulty and 's_hand_cls_seq' in batch_samples else None
+        s_foot_cls_seq = batch_samples['s_foot_cls_seq'].permute(1, 0).to(device) if use_difficulty and 's_foot_cls_seq' in batch_samples else None
+        s_move_cls_seq = batch_samples['s_move_cls_seq'].permute(1, 0).to(device) if use_difficulty and 's_move_cls_seq' in batch_samples else None
+
         # ドラム譜では属性は使用しない（Noneを渡す）
         trained_steps += 1
 
         # Mixed Precision Training
         if use_amp and scaler is not None:
             with torch.cuda.amp.autocast():
-                mu, logvar, dec_logits = model(
-                    batch_enc_inp,
-                    batch_dec_inp,
-                    batch_inp_bar_pos,
-                    None,  # rhythm frequency class (not used for drums)
-                    None,  # polyphony class (not used for drums)
-                    padding_mask=batch_padding_mask
-                )
+                if tokenization_method == 'cp_limb_v1':
+                    mu, logvar, cp_logits = model(
+                        batch_enc_inp,
+                        batch_dec_inp,
+                        batch_inp_bar_pos,
+                        None,
+                        None,
+                        s_tech_cls=s_tech_cls_seq,
+                        s_indep_cls=s_indep_cls_seq,
+                        s_hand_cls=s_hand_cls_seq,
+                        s_foot_cls=s_foot_cls_seq,
+                        s_move_cls=s_move_cls_seq,
+                        cp_event_type_inp=cp_event_type_inp,
+                        cp_struct_inp=cp_struct_inp,
+                        cp_pos_inp=cp_pos_inp,
+                        cp_hand1_inp=cp_hand1_inp,
+                        cp_hand2_inp=cp_hand2_inp,
+                        cp_right_foot_inp=cp_rf_inp,
+                        cp_left_foot_inp=cp_lf_inp,
+                        padding_mask=batch_padding_mask
+                    )
+                else:
+                    mu, logvar, dec_logits = model(
+                        batch_enc_inp,
+                        batch_dec_inp,
+                        batch_inp_bar_pos,
+                        None,  # rhythm frequency class (not used for drums)
+                        None,  # polyphony class (not used for drums)
+                        s_tech_cls=s_tech_cls_seq,
+                        s_indep_cls=s_indep_cls_seq,
+                        s_hand_cls=s_hand_cls_seq,
+                        s_foot_cls=s_foot_cls_seq,
+                        s_move_cls=s_move_cls_seq,
+                        padding_mask=batch_padding_mask
+                    )
 
                 # KLベータのスケジューリング
                 if not constant_kl:
@@ -122,7 +174,26 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched, config, traine
                 else:
                     kl_beta = kl_max_beta
 
-                losses = model.compute_loss(mu, logvar, kl_beta, free_bit_lambda, dec_logits, batch_dec_tgt)
+                if tokenization_method == 'cp_limb_v1':
+                    losses = model.compute_cp_loss(
+                        mu,
+                        logvar,
+                        kl_beta,
+                        free_bit_lambda,
+                        cp_logits,
+                        {
+                            'event_type': cp_event_type_tgt,
+                            'structural': cp_struct_tgt,
+                            'cp_pos': cp_pos_tgt,
+                            'cp_hand1': cp_hand1_tgt,
+                            'cp_hand2': cp_hand2_tgt,
+                            'cp_right_foot': cp_rf_tgt,
+                            'cp_left_foot': cp_lf_tgt,
+                        },
+                        loss_weights=cp_loss_weights
+                    )
+                else:
+                    losses = model.compute_loss(mu, logvar, kl_beta, free_bit_lambda, dec_logits, batch_dec_tgt)
 
             # 学習率のアニーリング
             if trained_steps < lr_warmup_steps:
@@ -140,14 +211,41 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched, config, traine
 
         else:
             # 通常の学習（AMP無し）
-            mu, logvar, dec_logits = model(
-                batch_enc_inp,
-                batch_dec_inp,
-                batch_inp_bar_pos,
-                None,  # rhythm frequency class (not used for drums)
-                None,  # polyphony class (not used for drums)
-                padding_mask=batch_padding_mask
-            )
+            if tokenization_method == 'cp_limb_v1':
+                mu, logvar, cp_logits = model(
+                    batch_enc_inp,
+                    batch_dec_inp,
+                    batch_inp_bar_pos,
+                    None,
+                    None,
+                    s_tech_cls=s_tech_cls_seq,
+                    s_indep_cls=s_indep_cls_seq,
+                    s_hand_cls=s_hand_cls_seq,
+                    s_foot_cls=s_foot_cls_seq,
+                    s_move_cls=s_move_cls_seq,
+                    cp_event_type_inp=cp_event_type_inp,
+                    cp_struct_inp=cp_struct_inp,
+                    cp_pos_inp=cp_pos_inp,
+                    cp_hand1_inp=cp_hand1_inp,
+                    cp_hand2_inp=cp_hand2_inp,
+                    cp_right_foot_inp=cp_rf_inp,
+                    cp_left_foot_inp=cp_lf_inp,
+                    padding_mask=batch_padding_mask
+                )
+            else:
+                mu, logvar, dec_logits = model(
+                    batch_enc_inp,
+                    batch_dec_inp,
+                    batch_inp_bar_pos,
+                    None,  # rhythm frequency class (not used for drums)
+                    None,  # polyphony class (not used for drums)
+                    s_tech_cls=s_tech_cls_seq,
+                    s_indep_cls=s_indep_cls_seq,
+                    s_hand_cls=s_hand_cls_seq,
+                    s_foot_cls=s_foot_cls_seq,
+                    s_move_cls=s_move_cls_seq,
+                    padding_mask=batch_padding_mask
+                )
 
             # KLベータのスケジューリング
             if not constant_kl:
@@ -155,7 +253,26 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched, config, traine
             else:
                 kl_beta = kl_max_beta
 
-            losses = model.compute_loss(mu, logvar, kl_beta, free_bit_lambda, dec_logits, batch_dec_tgt)
+            if tokenization_method == 'cp_limb_v1':
+                losses = model.compute_cp_loss(
+                    mu,
+                    logvar,
+                    kl_beta,
+                    free_bit_lambda,
+                    cp_logits,
+                    {
+                        'event_type': cp_event_type_tgt,
+                        'structural': cp_struct_tgt,
+                        'cp_pos': cp_pos_tgt,
+                        'cp_hand1': cp_hand1_tgt,
+                        'cp_hand2': cp_hand2_tgt,
+                        'cp_right_foot': cp_rf_tgt,
+                        'cp_left_foot': cp_lf_tgt,
+                    },
+                    loss_weights=cp_loss_weights
+                )
+            else:
+                losses = model.compute_loss(mu, logvar, kl_beta, free_bit_lambda, dec_logits, batch_dec_tgt)
 
             # 学習率のアニーリング
             if trained_steps < lr_warmup_steps:
@@ -178,6 +295,18 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched, config, traine
               f'\t * loss = (RC: {recons_loss_ema:.4f} | KL: {kl_loss_ema:.4f} | '
               f'KL_raw: {kl_raw_ema:.4f}), step = {trained_steps}, beta: {kl_beta:.4f} '
               f'time_elapsed = {time.time() - st:.2f} secs')
+
+        if tokenization_method == 'cp_limb_v1':
+            print(
+                ' \t * cp_loss = '
+                f"(evt: {losses['cp_event_type_loss'].item():.4f} | "
+                f"struct: {losses['cp_structural_loss'].item():.4f} | "
+                f"pos: {losses['cp_pos_loss'].item():.4f} | "
+                f"h1: {losses['cp_hand1_loss'].item():.4f} | "
+                f"h2: {losses['cp_hand2_loss'].item():.4f} | "
+                f"rf: {losses['cp_right_foot_loss'].item():.4f} | "
+                f"lf: {losses['cp_left_foot_loss'].item():.4f})"
+            )
 
         # ログの記録
         if not trained_steps % log_interval:
@@ -244,6 +373,9 @@ def validate(model, dloader, config, n_rounds=8):
     """モデルの検証"""
     model.eval()
     device = config['training']['device']
+    use_difficulty = config['model'].get('use_difficulty', False)
+    tokenization_method = config['data'].get('tokenization_method', 'standard')
+    cp_loss_weights = config['model'].get('cp_loss_weights', {})
 
     loss_rec = []
     kl_loss_rec = []
@@ -262,16 +394,82 @@ def validate(model, dloader, config, n_rounds=8):
                 batch_inp_bar_pos = batch_samples['bar_pos'].to(device)
                 batch_padding_mask = batch_samples['enc_padding_mask'].to(device)
 
-                mu, logvar, dec_logits = model(
-                    batch_enc_inp,
-                    batch_dec_inp,
-                    batch_inp_bar_pos,
-                    None,
-                    None,
-                    padding_mask=batch_padding_mask
-                )
+                cp_event_type_inp = batch_samples['cp_event_type_input'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+                cp_struct_inp = batch_samples['cp_struct_input'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+                cp_pos_inp = batch_samples['cp_pos_input'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+                cp_hand1_inp = batch_samples['cp_hand1_input'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+                cp_hand2_inp = batch_samples['cp_hand2_input'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+                cp_rf_inp = batch_samples['cp_right_foot_input'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+                cp_lf_inp = batch_samples['cp_left_foot_input'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
 
-                losses = model.compute_loss(mu, logvar, 0.0, 0.0, dec_logits, batch_dec_tgt)
+                cp_event_type_tgt = batch_samples['cp_event_type_target'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+                cp_struct_tgt = batch_samples['cp_struct_target'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+                cp_pos_tgt = batch_samples['cp_pos_target'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+                cp_hand1_tgt = batch_samples['cp_hand1_target'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+                cp_hand2_tgt = batch_samples['cp_hand2_target'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+                cp_rf_tgt = batch_samples['cp_right_foot_target'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+                cp_lf_tgt = batch_samples['cp_left_foot_target'].permute(1, 0).to(device) if tokenization_method == 'cp_limb_v1' else None
+
+                s_tech_cls_seq = batch_samples['s_tech_cls_seq'].permute(1, 0).to(device) if use_difficulty and 's_tech_cls_seq' in batch_samples else None
+                s_indep_cls_seq = batch_samples['s_indep_cls_seq'].permute(1, 0).to(device) if use_difficulty and 's_indep_cls_seq' in batch_samples else None
+                s_hand_cls_seq = batch_samples['s_hand_cls_seq'].permute(1, 0).to(device) if use_difficulty and 's_hand_cls_seq' in batch_samples else None
+                s_foot_cls_seq = batch_samples['s_foot_cls_seq'].permute(1, 0).to(device) if use_difficulty and 's_foot_cls_seq' in batch_samples else None
+                s_move_cls_seq = batch_samples['s_move_cls_seq'].permute(1, 0).to(device) if use_difficulty and 's_move_cls_seq' in batch_samples else None
+
+                if tokenization_method == 'cp_limb_v1':
+                    mu, logvar, cp_logits = model(
+                        batch_enc_inp,
+                        batch_dec_inp,
+                        batch_inp_bar_pos,
+                        None,
+                        None,
+                        s_tech_cls=s_tech_cls_seq,
+                        s_indep_cls=s_indep_cls_seq,
+                        s_hand_cls=s_hand_cls_seq,
+                        s_foot_cls=s_foot_cls_seq,
+                        s_move_cls=s_move_cls_seq,
+                        cp_event_type_inp=cp_event_type_inp,
+                        cp_struct_inp=cp_struct_inp,
+                        cp_pos_inp=cp_pos_inp,
+                        cp_hand1_inp=cp_hand1_inp,
+                        cp_hand2_inp=cp_hand2_inp,
+                        cp_right_foot_inp=cp_rf_inp,
+                        cp_left_foot_inp=cp_lf_inp,
+                        padding_mask=batch_padding_mask
+                    )
+                    losses = model.compute_cp_loss(
+                        mu,
+                        logvar,
+                        0.0,
+                        0.0,
+                        cp_logits,
+                        {
+                            'event_type': cp_event_type_tgt,
+                            'structural': cp_struct_tgt,
+                            'cp_pos': cp_pos_tgt,
+                            'cp_hand1': cp_hand1_tgt,
+                            'cp_hand2': cp_hand2_tgt,
+                            'cp_right_foot': cp_rf_tgt,
+                            'cp_left_foot': cp_lf_tgt,
+                        },
+                        loss_weights=cp_loss_weights
+                    )
+                else:
+                    mu, logvar, dec_logits = model(
+                        batch_enc_inp,
+                        batch_dec_inp,
+                        batch_inp_bar_pos,
+                        None,
+                        None,
+                        s_tech_cls=s_tech_cls_seq,
+                        s_indep_cls=s_indep_cls_seq,
+                        s_hand_cls=s_hand_cls_seq,
+                        s_foot_cls=s_foot_cls_seq,
+                        s_move_cls=s_move_cls_seq,
+                        padding_mask=batch_padding_mask
+                    )
+
+                    losses = model.compute_loss(mu, logvar, 0.0, 0.0, dec_logits, batch_dec_tgt)
                 if not (batch_idx + 1) % 10:
                     print(f'batch #{batch_idx + 1}:', round(losses['recons_loss'].item(), 3))
 
@@ -290,6 +488,8 @@ def main():
 
     # 設定を読み込み
     config = yaml.load(open(args.config, 'r'), Loader=yaml.FullLoader)
+    tokenization_method = config['data'].get('tokenization_method', 'standard')
+    use_difficulty = config['model'].get('use_difficulty', False)
 
     # デバイスの選択（コマンドライン引数が優先）
     if args.device is not None:
@@ -333,7 +533,9 @@ def main():
         model_dec_seqlen=config['data']['dec_seqlen'],
         model_max_bars=config['data']['max_bars'],
         pieces=pickle_load(config['data']['train_split']),
-        pad_to_same=True
+        pad_to_same=True,
+        use_difficulty=use_difficulty,
+        tokenization_method=tokenization_method
     )
 
     print('[info] Loading validation dataset...')
@@ -344,7 +546,9 @@ def main():
         model_dec_seqlen=config['data']['dec_seqlen'],
         model_max_bars=config['data']['max_bars'],
         pieces=pickle_load(config['data']['val_split']),
-        pad_to_same=True
+        pad_to_same=True,
+        use_difficulty=use_difficulty,
+        tokenization_method=tokenization_method
     )
 
     print(f'[info] # training samples: {len(dset.pieces)}')
@@ -382,6 +586,28 @@ def main():
         dset.vocab_size,
         d_polyph_emb=mconf.get('d_polyph_emb', 0),
         d_rfreq_emb=mconf.get('d_rfreq_emb', 0),
+        d_s_tech_emb=mconf.get('d_s_tech_emb', 32),
+        d_s_indep_emb=mconf.get('d_s_indep_emb', 32),
+        d_s_hand_emb=mconf.get('d_s_hand_emb', 32),
+        d_s_foot_emb=mconf.get('d_s_foot_emb', 32),
+        d_s_move_emb=mconf.get('d_s_move_emb', 32),
+        n_s_tech_cls=mconf.get('n_s_tech_cls', 8),
+        n_s_indep_cls=mconf.get('n_s_indep_cls', 8),
+        n_s_hand_cls=mconf.get('n_s_hand_cls', 8),
+        n_s_foot_cls=mconf.get('n_s_foot_cls', 8),
+        n_s_move_cls=mconf.get('n_s_move_cls', 8),
+        use_difficulty=use_difficulty,
+        tokenization_method=tokenization_method,
+        cp_event_type_vocab_size=len(getattr(dset, 'event_type2idx', {'<PAD_EVENT>': 2})) if tokenization_method == 'cp_limb_v1' else 3,
+        cp_struct_vocab_size=dset.vocab_size,
+        cp_pos_vocab_size=(getattr(dset, 'pos_pad_value', 24) + 1) if tokenization_method == 'cp_limb_v1' else 25,
+        cp_limb_vocab_size=len(getattr(dset, 'limb_token2idx', {'<PAD>': 0})) if tokenization_method == 'cp_limb_v1' else 2,
+        cp_event_pad_idx=getattr(dset, 'event_type2idx', {'<PAD_EVENT>': 2}).get('<PAD_EVENT>', 2) if tokenization_method == 'cp_limb_v1' else 2,
+        cp_struct_pad_idx=getattr(dset, 'struct_token2idx', {'<PAD>': 0}).get('<PAD>', 0) if tokenization_method == 'cp_limb_v1' else 0,
+        cp_pos_pad_idx=getattr(dset, 'pos_pad_value', 24),
+        cp_limb_pad_idx=getattr(dset, 'limb_token2idx', {'<PAD>': 0}).get('<PAD>', 0) if tokenization_method == 'cp_limb_v1' else 0,
+        d_cp_pos_emb=mconf.get('d_cp_pos_emb', 64),
+        d_cp_limb_emb=mconf.get('d_cp_limb_emb', 64),
         cond_mode=mconf.get('cond_mode', 'none')
     )
 

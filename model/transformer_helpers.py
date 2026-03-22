@@ -89,3 +89,36 @@ class TokenEmbedding(nn.Module):
       inp_emb = self.emb_proj(inp_emb)
 
     return inp_emb.mul_(self.emb_scale)
+
+
+class CpCompositeEmbedding(nn.Module):
+  def __init__(
+    self,
+    n_pos,
+    n_limb_token,
+    d_pos,
+    d_limb,
+    d_proj
+  ):
+    super(CpCompositeEmbedding, self).__init__()
+
+    self.pos_emb = nn.Embedding(n_pos, d_pos)
+    self.hand1_emb = nn.Embedding(n_limb_token, d_limb)
+    self.hand2_emb = nn.Embedding(n_limb_token, d_limb)
+    self.rf_emb = nn.Embedding(n_limb_token, d_limb)
+    self.lf_emb = nn.Embedding(n_limb_token, d_limb)
+
+    d_cat = d_pos + (d_limb * 4)
+    self.proj = nn.Linear(d_cat, d_proj, bias=False)
+    self.emb_scale = d_proj ** 0.5
+
+  def forward(self, pos, hand1, hand2, right_foot, left_foot):
+    pos_e = self.pos_emb(pos)
+    h1_e = self.hand1_emb(hand1)
+    h2_e = self.hand2_emb(hand2)
+    rf_e = self.rf_emb(right_foot)
+    lf_e = self.lf_emb(left_foot)
+
+    cp_cat = torch.cat([pos_e, h1_e, h2_e, rf_e, lf_e], dim=-1)
+    cp_proj = self.proj(cp_cat)
+    return cp_proj.mul_(self.emb_scale)

@@ -4,6 +4,7 @@
 data:
   data_dir: './drum_prepare'              # トークン化されたドラムデータのディレクトリ
   vocab_path: './drum_vocab.pkl'          # 語彙ファイルのパス
+  tokenization_method: 'standard'         # 'standard' or 'cp_limb_v1'
   train_split: './drum_prepare/train_split.pkl'  # 訓練データ分割
   val_split: './drum_prepare/val_split.pkl'      # 検証データ分割
   enc_seqlen: 128                         # エンコーダー最大系列長
@@ -34,6 +35,20 @@ model:
   d_polyph_emb: 0                         # ポリフォニー埋め込み次元（0=無効）
   d_rfreq_emb: 0                          # リズム頻度埋め込み次元（0=無効）
   cond_mode: 'none'                       # 条件付けモード（'none', 'add', 'concat'）
+
+  # CP方式で使用する設定（cp_limb_v1）
+  cp_loss_weights:
+    event_type: 1.0
+    structural: 1.0
+    cp_pos: 1.0
+    cp_hand1: 1.0
+    cp_hand2: 1.0
+    cp_right_foot: 1.0
+    cp_left_foot: 1.0
+
+  # CP方式の埋め込み次元
+  d_cp_pos_emb: 64
+  d_cp_limb_emb: 64
 
   # 事前学習済みモデル（オプション）
   pretrained_params_path: null            # 事前学習済みパラメータのパス

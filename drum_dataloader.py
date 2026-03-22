@@ -31,7 +31,8 @@ class DrumTransformerDataset(Dataset):
         pad_to_same: bool = True,
         appoint_st_bar: Optional[int] = None,
         dec_end_pad_value: Optional[str] = None,
-        use_difficulty: bool = False  # ===== 追加: 難易度クラスを使用するか =====
+        use_difficulty: bool = False,  # ===== 追加: 難易度クラスを使用するか =====
+        tokenization_method: str = 'standard'
     ):
         """
         Args:
@@ -46,6 +47,7 @@ class DrumTransformerDataset(Dataset):
             dec_end_pad_value: デコーダー末尾のパディング値（'EOS' or None）
         """
         self.vocab_path = vocab_path
+        self.tokenization_method = tokenization_method
         self.read_vocab()
 
         self.data_dir = data_dir
@@ -69,15 +71,47 @@ class DrumTransformerDataset(Dataset):
 
     def read_vocab(self):
         """語彙を読み込み"""
-        token2idx, idx2token = pickle_load(self.vocab_path)
-        self.token2idx = token2idx
-        self.idx2token = idx2token
+        vocab_payload = pickle_load(self.vocab_path)
 
-        # 特殊トークン
-        self.bar_token = self.token2idx['<BAR>']
-        self.eos_token = self.token2idx['<EOS>']
-        self.pad_token = len(self.token2idx)  # PADトークンは語彙の末尾に追加
-        self.vocab_size = self.pad_token + 1
+        if isinstance(vocab_payload, dict) and vocab_payload.get('tokenization_method') == 'cp_limb_v1':
+            self.tokenization_method = 'cp_limb_v1'
+
+            self.event_type2idx = vocab_payload['event_type2idx']
+            self.idx2event_type = vocab_payload['idx2event_type']
+
+            self.struct_token2idx = vocab_payload['struct_token2idx']
+            self.idx2struct_token = vocab_payload['idx2struct_token']
+            self.limb_token2idx = vocab_payload['limb_token2idx']
+            self.idx2limb_token = vocab_payload['idx2limb_token']
+
+            self.pos_pad_value = vocab_payload.get('pos_pad_value', 24)
+
+            self.bar_token = self.struct_token2idx['<BAR>']
+            self.eos_token = self.struct_token2idx['<EOS>']
+            self.pad_token = self.struct_token2idx['<PAD>']
+
+            # 既存呼び出しとの互換のため、構造語彙サイズをvocab_sizeとして公開
+            self.vocab_size = len(self.struct_token2idx)
+        else:
+            token2idx, idx2token = vocab_payload
+            self.token2idx = token2idx
+            self.idx2token = idx2token
+
+            # 特殊トークン
+            self.bar_token = self.token2idx['<BAR>']
+            self.eos_token = self.token2idx['<EOS>']
+            self.pad_token = len(self.token2idx)  # PADトークンは語彙の末尾に追加
+            self.vocab_size = self.pad_token + 1
+
+    def _piece_len(self, piece_evs):
+        if isinstance(piece_evs, dict):
+            return len(piece_evs['event_type'])
+        return len(piece_evs)
+
+    def _slice_piece_evs(self, piece_evs, st, ed):
+        if isinstance(piece_evs, dict):
+            return {k: v[st:ed] for k, v in piece_evs.items()}
+        return piece_evs[st:ed]
 
     def build_dataset(self):
         """データセットを構築"""
@@ -103,14 +137,16 @@ class DrumTransformerDataset(Dataset):
                 bar_pos, p_evs = pickle_load(p)
 
                 # 最後の小節位置を調整
-                if bar_pos[-1] == len(p_evs):
+                p_len = self._piece_len(p_evs)
+
+                if bar_pos[-1] == p_len:
                     bar_pos = bar_pos[:-1]
 
-                if len(p_evs) - bar_pos[-1] <= 2:
+                if p_len - bar_pos[-1] <= 2:
                     # 空の末尾小節を除く
                     bar_pos = bar_pos[:-1]
 
-                bar_pos.append(len(p_evs))
+                bar_pos.append(p_len)
                 self.piece_bar_pos.append(bar_pos)
 
             except Exception as e:
@@ -146,9 +182,11 @@ class DrumTransformerDataset(Dataset):
 
         # 小節数に応じてトリミングまたはパディング
         if len(piece_bar_pos) > self.model_max_bars:
-            piece_evs = piece_evs[
-                piece_bar_pos[picked_st_bar]: piece_bar_pos[picked_st_bar + self.model_max_bars]
-            ]
+            piece_evs = self._slice_piece_evs(
+                piece_evs,
+                piece_bar_pos[picked_st_bar],
+                piece_bar_pos[picked_st_bar + self.model_max_bars]
+            )
             picked_bar_pos = np.array(
                 piece_bar_pos[picked_st_bar: picked_st_bar + self.model_max_bars]
             ) - piece_bar_pos[picked_st_bar]
@@ -232,45 +270,122 @@ class DrumTransformerDataset(Dataset):
         bar_tokens, st_bar, bar_pos, enc_n_bars, difficulty_classes = self.get_sample_from_file(idx)
         # =========================================
 
-        # トークンのリストに変換
-        if isinstance(bar_tokens, np.ndarray):
-            bar_tokens = bar_tokens.tolist()
+        if self.tokenization_method == 'cp_limb_v1':
+            seq_len = len(bar_tokens['event_type'])
+            bar_pos = bar_pos.tolist() + [seq_len]
 
-        bar_pos = bar_pos.tolist() + [len(bar_tokens)]
-
-        # エンコーダー入力データを生成
-        enc_inp, enc_padding_mask, enc_lens = self.get_encoder_input_data(
-            np.array(bar_pos), bar_tokens
-        )
-
-        # デコーダー入力/ターゲットを生成
-        length = len(bar_tokens)
-        if self.pad_to_same:
-            inp = self.pad_sequence(bar_tokens, self.model_dec_seqlen + 1)
-        else:
-            inp = self.pad_sequence(
-                bar_tokens,
-                len(bar_tokens) + 1,
-                pad_value=self.dec_end_pad_value
+            struct_seq = bar_tokens['struct_token']
+            enc_inp, enc_padding_mask, enc_lens = self.get_encoder_input_data(
+                np.array(bar_pos), struct_seq
             )
 
-        target = np.array(inp[1:], dtype=int)
-        inp = np.array(inp[:-1], dtype=int)
-        assert len(inp) == len(target)
+            length = seq_len
 
-        result = {
-            'id': idx,
-            'piece_id': int(os.path.basename(self.pieces[idx]).replace('.pkl', '')),
-            'st_bar_id': st_bar,
-            'bar_pos': np.array(bar_pos, dtype=int),
-            'enc_input': enc_inp,
-            'dec_input': inp[:self.model_dec_seqlen],
-            'dec_target': target[:self.model_dec_seqlen],
-            'length': min(length, self.model_dec_seqlen),
-            'enc_padding_mask': enc_padding_mask,
-            'enc_length': enc_lens,
-            'enc_n_bars': enc_n_bars
-        }
+            def pad_and_shift(seq, pad_value):
+                seq = list(seq)
+                if self.pad_to_same:
+                    inp_full = self.pad_sequence(seq, self.model_dec_seqlen + 1, pad_value=pad_value)
+                else:
+                    inp_full = self.pad_sequence(seq, len(seq) + 1, pad_value=pad_value)
+                tgt = np.array(inp_full[1:], dtype=int)
+                inp = np.array(inp_full[:-1], dtype=int)
+                return inp[:self.model_dec_seqlen], tgt[:self.model_dec_seqlen]
+
+            event_inp, event_tgt = pad_and_shift(
+                bar_tokens['event_type'], self.event_type2idx['<PAD_EVENT>']
+            )
+            struct_inp, struct_tgt = pad_and_shift(
+                bar_tokens['struct_token'], self.struct_token2idx['<PAD>']
+            )
+            pos_inp, pos_tgt = pad_and_shift(
+                bar_tokens['cp_pos'], self.pos_pad_value
+            )
+            h1_inp, h1_tgt = pad_and_shift(
+                bar_tokens['cp_hand1'], self.limb_token2idx['<PAD>']
+            )
+            h2_inp, h2_tgt = pad_and_shift(
+                bar_tokens['cp_hand2'], self.limb_token2idx['<PAD>']
+            )
+            rf_inp, rf_tgt = pad_and_shift(
+                bar_tokens['cp_right_foot'], self.limb_token2idx['<PAD>']
+            )
+            lf_inp, lf_tgt = pad_and_shift(
+                bar_tokens['cp_left_foot'], self.limb_token2idx['<PAD>']
+            )
+
+            cp_event_id = self.event_type2idx['CP']
+            cp_mask = (event_inp == cp_event_id).astype(np.int32)
+
+            result = {
+                'id': idx,
+                'piece_id': int(os.path.basename(self.pieces[idx]).replace('.pkl', '')),
+                'st_bar_id': st_bar,
+                'bar_pos': np.array(bar_pos, dtype=int),
+                'enc_input': enc_inp,
+                # 互換キー: 既存コードが dec_input/target を参照するため構造系列を入れる
+                'dec_input': struct_inp,
+                'dec_target': struct_tgt,
+                'length': min(length, self.model_dec_seqlen),
+                'enc_padding_mask': enc_padding_mask,
+                'enc_length': enc_lens,
+                'enc_n_bars': enc_n_bars,
+                # CP専用系列
+                'cp_event_type_input': event_inp,
+                'cp_event_type_target': event_tgt,
+                'cp_struct_input': struct_inp,
+                'cp_struct_target': struct_tgt,
+                'cp_pos_input': pos_inp,
+                'cp_pos_target': pos_tgt,
+                'cp_hand1_input': h1_inp,
+                'cp_hand1_target': h1_tgt,
+                'cp_hand2_input': h2_inp,
+                'cp_hand2_target': h2_tgt,
+                'cp_right_foot_input': rf_inp,
+                'cp_right_foot_target': rf_tgt,
+                'cp_left_foot_input': lf_inp,
+                'cp_left_foot_target': lf_tgt,
+                'cp_mask': cp_mask,
+            }
+        else:
+            # トークンのリストに変換
+            if isinstance(bar_tokens, np.ndarray):
+                bar_tokens = bar_tokens.tolist()
+
+            bar_pos = bar_pos.tolist() + [len(bar_tokens)]
+
+            # エンコーダー入力データを生成
+            enc_inp, enc_padding_mask, enc_lens = self.get_encoder_input_data(
+                np.array(bar_pos), bar_tokens
+            )
+
+            # デコーダー入力/ターゲットを生成
+            length = len(bar_tokens)
+            if self.pad_to_same:
+                inp = self.pad_sequence(bar_tokens, self.model_dec_seqlen + 1)
+            else:
+                inp = self.pad_sequence(
+                    bar_tokens,
+                    len(bar_tokens) + 1,
+                    pad_value=self.dec_end_pad_value
+                )
+
+            target = np.array(inp[1:], dtype=int)
+            inp = np.array(inp[:-1], dtype=int)
+            assert len(inp) == len(target)
+
+            result = {
+                'id': idx,
+                'piece_id': int(os.path.basename(self.pieces[idx]).replace('.pkl', '')),
+                'st_bar_id': st_bar,
+                'bar_pos': np.array(bar_pos, dtype=int),
+                'enc_input': enc_inp,
+                'dec_input': inp[:self.model_dec_seqlen],
+                'dec_target': target[:self.model_dec_seqlen],
+                'length': min(length, self.model_dec_seqlen),
+                'enc_padding_mask': enc_padding_mask,
+                'enc_length': enc_lens,
+                'enc_n_bars': enc_n_bars
+            }
 
         # ===== 追加: 難易度クラスをresultに追加 =====
         if self.use_difficulty and difficulty_classes is not None:

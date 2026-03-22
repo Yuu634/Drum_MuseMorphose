@@ -1,6 +1,7 @@
 data:
   data_dir: './drum_dataset_with_difficulty'
   vocab_path: './drum_vocab.pkl'
+  tokenization_method: 'standard'
   difficulty_bounds_path: './difficulty_bounds.pkl'
   train_split: './pickles/train_split.pkl'
   val_split: './pickles/val_split.pkl'
@@ -42,6 +43,19 @@ model:
 
   # 条件付けモード
   cond_mode: 'in-attn'
+
+  # CP方式（cp_limb_v1）で利用する損失重み
+  cp_loss_weights:
+    event_type: 1.0
+    structural: 1.0
+    cp_pos: 1.0
+    cp_hand1: 1.0
+    cp_hand2: 1.0
+    cp_right_foot: 1.0
+    cp_left_foot: 1.0
+
+  d_cp_pos_emb: 64
+  d_cp_limb_emb: 64
 
   # 事前学習済みモデルのパス (オプション)
   pretrained_params_path: null
