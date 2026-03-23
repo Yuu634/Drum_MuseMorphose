@@ -491,6 +491,13 @@ def main():
     tokenization_method = config['data'].get('tokenization_method', 'standard')
     use_difficulty = config['model'].get('use_difficulty', False)
 
+    supported_tokenization = {'standard', 'cp_limb_v1', 'remi'}
+    if tokenization_method not in supported_tokenization:
+        raise ValueError(
+            f"Unsupported tokenization_method: {tokenization_method}. "
+            f"Supported: {sorted(supported_tokenization)}"
+        )
+
     # デバイスの選択（コマンドライン引数が優先）
     if args.device is not None:
         device = args.device
@@ -514,6 +521,7 @@ def main():
                 device = 'cpu'
 
     print(f'[info] Using device: {device}')
+    print(f'[info] Tokenization method: {tokenization_method}')
     trained_steps = config['training']['trained_steps']
     lr_decay_steps = config['training']['lr_decay_steps']
     max_lr = config['training']['max_lr']

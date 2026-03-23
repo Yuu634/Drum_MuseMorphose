@@ -134,7 +134,17 @@ class DrumTransformerDataset(Dataset):
                 print(f'[preparing data] now at #{i}')
 
             try:
-                bar_pos, p_evs = pickle_load(p)
+                data = pickle_load(p)
+
+                # データ形式を確認（2要素または3要素タプル）
+                if len(data) == 2:
+                    bar_pos, p_evs = data
+                elif len(data) == 3:
+                    bar_pos, p_evs, _ = data
+                else:
+                    print(f'Error loading {p}: Unknown data format')
+                    self.piece_bar_pos.append([0])
+                    continue
 
                 # 最後の小節位置を調整
                 p_len = self._piece_len(p_evs)

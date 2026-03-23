@@ -21,9 +21,16 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pickle
 import numpy as np
 import miditoolkit
-from typing import List, Dict, Tuple
-from drum_tokenizer import DrumTokenizer
-from drum_to_midi import DrumToken2MIDI
+from typing import List, Dict, Tuple, Optional
+from drum_tokenizer import DrumTokenizer, DRUM_NOTE_MAP
+from drum_cp_tokenizer import DrumCPTokenizer
+from prepare_drum_dataset import RemiDrumTokenizer
+from drum_to_midi import DrumToken2MIDI, cp_data_to_midi
+
+
+DEFAULT_BEAT_RESOL = 480
+DEFAULT_BAR_RESOL = 480 * 4
+REMI_STEPS_PER_BAR = 96  # REMI also uses 96 divisions per bar (same as Standard/CP)
 
 
 # ピッチ許容リスト（異なる音程でも同じドラム楽器とみなす）
@@ -178,9 +185,18 @@ class MIDIComparator:
 
                 # タイミングの誤差を記録（正規化単位）
                 if best_distance > 0:
+                    orig_bar, orig_beat, orig_pos = tick_to_bar_beat_pos(note1['start'], ticks_per_beat1)
+                    conv_bar, conv_beat, conv_pos = tick_to_bar_beat_pos(note2['start'], ticks_per_beat2)
                     result['timing_errors'].append({
                         'note_index': i,
                         'pitch': note1['pitch'],
+                        'note_type': pitch_to_note_type(note1['pitch']),
+                        'original_bar': orig_bar,
+                        'original_beat': orig_beat,
+                        'original_position': orig_pos,
+                        'converted_bar': conv_bar,
+                        'converted_beat': conv_beat,
+                        'converted_position': conv_pos,
                         'start_diff_normalized': best_distance,  # beat単位
                         'start_diff_ticks': best_distance * ticks_per_beat1,  # tick単位
                         'original_start': note1['start'],
@@ -190,17 +206,27 @@ class MIDIComparator:
                 # ベロシティの差を記録
                 vel_diff = abs(note2['velocity'] - note1['velocity'])
                 if vel_diff > 5:  # 5以上の差がある場合
+                    bar, beat, pos = tick_to_bar_beat_pos(note1['start'], ticks_per_beat1)
                     result['velocity_errors'].append({
                         'note_index': i,
                         'pitch': note1['pitch'],
+                        'note_type': pitch_to_note_type(note1['pitch']),
+                        'bar': bar,
+                        'beat': beat,
+                        'position': pos,
                         'original_velocity': note1['velocity'],
                         'converted_velocity': note2['velocity'],
                         'difference': vel_diff
                     })
             else:
+                bar, beat, pos = tick_to_bar_beat_pos(note1['start'], ticks_per_beat1)
                 result['missing_notes'].append({
                     'note_index': i,
                     'pitch': note1['pitch'],
+                    'note_type': pitch_to_note_type(note1['pitch']),
+                    'bar': bar,
+                    'beat': beat,
+                    'position': pos,
                     'start': note1['start'],
                     'velocity': note1['velocity']
                 })
@@ -208,9 +234,14 @@ class MIDIComparator:
         # マッチしなかった変換後のノートを記録
         for j, note2 in enumerate(notes2):
             if j not in matched_indices:
+                bar, beat, pos = tick_to_bar_beat_pos(note2['start'], ticks_per_beat2)
                 result['extra_notes'].append({
                     'note_index': j,
                     'pitch': note2['pitch'],
+                    'note_type': pitch_to_note_type(note2['pitch']),
+                    'bar': bar,
+                    'beat': beat,
+                    'position': pos,
                     'start': note2['start'],
                     'velocity': note2['velocity']
                 })
@@ -225,10 +256,280 @@ class MIDIComparator:
         return is_match, result
 
 
+def get_tokenizer(tokenization_method: str):
+    """トークナイズ方式に応じてトークナイザーを返す。"""
+    if tokenization_method == 'standard':
+        return DrumTokenizer()
+    if tokenization_method == 'remi':
+        return RemiDrumTokenizer()
+    if tokenization_method == 'cp_limb_v1':
+        return DrumCPTokenizer()
+
+    raise ValueError(f"Unsupported tokenization_method: {tokenization_method}")
+
+
+def remi_tokens_to_midi(tokens: List[str], output_path: Optional[str] = None) -> miditoolkit.MidiFile:
+    """REMI風トークン列をドラムMIDIへ復元する。"""
+    midi_obj = miditoolkit.MidiFile()
+    midi_obj.ticks_per_beat = DEFAULT_BEAT_RESOL
+
+    drum_track = miditoolkit.Instrument(program=0, is_drum=True, name='Drums')
+    step_ticks = DEFAULT_BAR_RESOL // REMI_STEPS_PER_BAR
+
+    current_bar = -1
+    current_step = 0
+    total_bars = 0
+    pending_tempo = 120
+    tempo_changes = []
+
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+
+        if token == '<BAR>':
+            current_bar += 1
+            current_step = 0
+            total_bars = max(total_bars, current_bar + 1)
+            i += 1
+            continue
+
+        if token.startswith('<TEMPO_'):
+            try:
+                pending_tempo = int(token.replace('<TEMPO_', '').replace('>', ''))
+                tempo_time = max(0, current_bar) * DEFAULT_BAR_RESOL + current_step * step_ticks
+                tempo_changes.append(miditoolkit.TempoChange(pending_tempo, tempo_time))
+            except ValueError:
+                pass
+            i += 1
+            continue
+
+        if token.startswith('<BEAT_'):
+            try:
+                current_step = int(token.replace('<BEAT_', '').replace('>', ''))
+            except ValueError:
+                current_step = 0
+            i += 1
+            continue
+
+        if token == '<EOS>':
+            break
+
+        if token.startswith('Note_Pitch_') and i + 2 < len(tokens):
+            vel_token = tokens[i + 1]
+            dur_token = tokens[i + 2]
+
+            if vel_token.startswith('Note_Velocity_') and dur_token.startswith('Note_Duration_'):
+                try:
+                    pitch = int(token.replace('Note_Pitch_', ''))
+                    velocity_bin = int(vel_token.replace('Note_Velocity_', ''))
+                    duration_steps = int(dur_token.replace('Note_Duration_', ''))
+
+                    velocity = min(127, max(1, velocity_bin * 4 + 2))
+                    start_tick = max(0, current_bar) * DEFAULT_BAR_RESOL + current_step * step_ticks
+                    end_tick = start_tick + max(1, duration_steps) * step_ticks
+
+                    drum_track.notes.append(
+                        miditoolkit.Note(
+                            velocity=velocity,
+                            pitch=pitch,
+                            start=start_tick,
+                            end=end_tick,
+                        )
+                    )
+                    i += 3
+                    continue
+                except ValueError:
+                    pass
+
+        i += 1
+
+    if not tempo_changes:
+        tempo_changes.append(miditoolkit.TempoChange(120, 0))
+
+    tempo_changes.sort(key=lambda x: x.time)
+    midi_obj.tempo_changes = tempo_changes
+    midi_obj.instruments.append(drum_track)
+
+    for bar in range(max(1, total_bars)):
+        midi_obj.markers.append(miditoolkit.Marker(f'Bar-{bar + 1}', bar * DEFAULT_BAR_RESOL))
+
+    midi_obj.max_tick = max(max(1, total_bars) * DEFAULT_BAR_RESOL, midi_obj.max_tick)
+
+    if output_path is not None:
+        midi_obj.dump(output_path)
+
+    return midi_obj
+
+
+def pitch_to_note_type(pitch: int) -> str:
+    """MIDI pitch をドラム譜上のノート種別へ変換。"""
+    if pitch in DRUM_NOTE_MAP:
+        drum_type, technique = DRUM_NOTE_MAP[pitch]
+        return f"{drum_type}_{technique}"
+    return f"UNKNOWN_{pitch}"
+
+
+def tick_to_bar_beat_pos(tick: int, ticks_per_beat: int) -> Tuple[int, int, int]:
+    """tick から小節・拍・位置(24分割)を計算。"""
+    bar_ticks = ticks_per_beat * 4
+    bar = tick // bar_ticks + 1
+    tick_in_bar = tick % bar_ticks
+    beat = tick_in_bar // ticks_per_beat + 1
+    tick_in_beat = tick_in_bar % ticks_per_beat
+    pos = (tick_in_beat * 24) // ticks_per_beat
+    return bar, beat, pos
+
+
+def get_first_drum_note_tick(midi_obj: miditoolkit.MidiFile) -> Optional[int]:
+    """ドラムトラック内の最初のノート開始tickを返す。"""
+    first_tick = None
+    for instrument in midi_obj.instruments:
+        if not instrument.is_drum:
+            continue
+        for note in instrument.notes:
+            if first_tick is None or note.start < first_tick:
+                first_tick = note.start
+    return first_tick
+
+
+def align_reconstructed_midi_to_first_note_beat(
+    midi_obj: miditoolkit.MidiFile,
+    target_first_note_beat: Optional[float],
+) -> int:
+    """復元MIDIの最初のドラムノートを指定beat位置へ合わせる。"""
+    if target_first_note_beat is None or midi_obj.ticks_per_beat <= 0:
+        return 0
+
+    first_tick = get_first_drum_note_tick(midi_obj)
+    if first_tick is None:
+        return 0
+
+    current_first_note_beat = first_tick / midi_obj.ticks_per_beat
+    delta_beats = target_first_note_beat - current_first_note_beat
+    delta_ticks = int(round(delta_beats * midi_obj.ticks_per_beat))
+
+    if delta_ticks == 0:
+        return 0
+
+    # ノート位置をシフトして、先頭空小節を保持する
+    for instrument in midi_obj.instruments:
+        for note in instrument.notes:
+            note.start = max(0, note.start + delta_ticks)
+            note.end = max(note.start + 1, note.end + delta_ticks)
+
+    # 初期テンポ(0tick)は保持し、それ以降のイベントをシフトする
+    for tempo_change in midi_obj.tempo_changes:
+        if tempo_change.time > 0:
+            tempo_change.time = max(0, tempo_change.time + delta_ticks)
+
+    for marker in midi_obj.markers:
+        marker.time = max(0, marker.time + delta_ticks)
+
+    for ts_change in midi_obj.time_signature_changes:
+        if ts_change.time > 0:
+            ts_change.time = max(0, ts_change.time + delta_ticks)
+
+    for ks_change in midi_obj.key_signature_changes:
+        if ks_change.time > 0:
+            ks_change.time = max(0, ks_change.time + delta_ticks)
+
+    if hasattr(midi_obj, 'max_tick') and midi_obj.max_tick is not None:
+        midi_obj.max_tick = max(0, midi_obj.max_tick + delta_ticks)
+
+    return delta_ticks
+
+
+def write_comparison_log(
+    log_path: str,
+    input_file: str,
+    reconstructed_file: str,
+    tokenization_method: str,
+    comparison_result: Dict,
+    append: bool = False,
+):
+    """比較結果を詳細ログとして保存。"""
+    mode = 'a' if append else 'w'
+    with open(log_path, mode, encoding='utf-8') as f:
+        f.write("=" * 100 + "\n")
+        f.write("MIDI Round-trip Comparison Log\n")
+        f.write("=" * 100 + "\n")
+        f.write(f"Input MIDI: {input_file}\n")
+        f.write(f"Reconstructed MIDI: {reconstructed_file}\n")
+        f.write(f"Tokenization method: {tokenization_method}\n")
+        f.write(f"ticks_per_beat (original): {comparison_result['ticks_per_beat_1']}\n")
+        f.write(f"ticks_per_beat (reconstructed): {comparison_result['ticks_per_beat_2']}\n")
+        f.write("\n")
+
+        f.write("[Summary]\n")
+        f.write(f"- total_notes_original: {comparison_result['total_notes_1']}\n")
+        f.write(f"- total_notes_reconstructed: {comparison_result['total_notes_2']}\n")
+        f.write(f"- matched_notes: {comparison_result['matched_notes']}\n")
+        f.write(f"- missing_notes: {len(comparison_result['missing_notes'])}\n")
+        f.write(f"- extra_notes: {len(comparison_result['extra_notes'])}\n")
+        f.write(f"- timing_errors: {len(comparison_result['timing_errors'])}\n")
+        f.write(f"- velocity_errors: {len(comparison_result['velocity_errors'])}\n")
+        f.write("\n")
+
+        f.write("[Missing Notes]\n")
+        if comparison_result['missing_notes']:
+            for n in comparison_result['missing_notes']:
+                f.write(
+                    "- type=missing "
+                    f"bar={n['bar']} beat={n['beat']} pos={n['position']} "
+                    f"pitch={n['pitch']} note_type={n['note_type']} "
+                    f"start_tick={n['start']} velocity={n['velocity']}\n"
+                )
+        else:
+            f.write("- none\n")
+        f.write("\n")
+
+        f.write("[Extra Notes]\n")
+        if comparison_result['extra_notes']:
+            for n in comparison_result['extra_notes']:
+                f.write(
+                    "- type=extra "
+                    f"bar={n['bar']} beat={n['beat']} pos={n['position']} "
+                    f"pitch={n['pitch']} note_type={n['note_type']} "
+                    f"start_tick={n['start']} velocity={n['velocity']}\n"
+                )
+        else:
+            f.write("- none\n")
+        f.write("\n")
+
+        f.write("[Timing Errors]\n")
+        if comparison_result['timing_errors']:
+            for e in comparison_result['timing_errors']:
+                f.write(
+                    "- "
+                    f"pitch={e['pitch']} note_type={e['note_type']} "
+                    f"orig(bar={e['original_bar']},beat={e['original_beat']},pos={e['original_position']},tick={e['original_start']}) "
+                    f"recon(bar={e['converted_bar']},beat={e['converted_beat']},pos={e['converted_position']},tick={e['converted_start']}) "
+                    f"diff_ticks={e['start_diff_ticks']:.2f} diff_beats={e['start_diff_normalized']:.4f}\n"
+                )
+        else:
+            f.write("- none\n")
+        f.write("\n")
+
+        f.write("[Velocity Errors]\n")
+        if comparison_result['velocity_errors']:
+            for e in comparison_result['velocity_errors']:
+                f.write(
+                    "- "
+                    f"pitch={e['pitch']} note_type={e['note_type']} "
+                    f"bar={e['bar']} beat={e['beat']} pos={e['position']} "
+                    f"original_velocity={e['original_velocity']} converted_velocity={e['converted_velocity']} "
+                    f"difference={e['difference']}\n"
+                )
+        else:
+            f.write("- none\n")
+
+
 def test_round_trip(
     midi_path: str,
     output_dir: str,
-    vocab_path: str = None
+    vocab_path: str = None,
+    tokenization_method: str = 'standard',
+    comparison_log_path: Optional[str] = None,
 ) -> Dict:
     """
     往復変換テストを実行
@@ -249,6 +550,7 @@ def test_round_trip(
 
     result = {
         'input_file': midi_path,
+        'tokenization_method': tokenization_method,
         'success': False,
         'steps': {}
     }
@@ -256,9 +558,10 @@ def test_round_trip(
     try:
         # ステップ1: トークナイザーの初期化
         print("ステップ1: トークナイザーの初期化")
-        tokenizer = DrumTokenizer()
+        tokenizer = get_tokenizer(tokenization_method)
+        print(f"  トークナイズ方式: {tokenization_method}")
 
-        if vocab_path and os.path.exists(vocab_path):
+        if tokenization_method == 'standard' and vocab_path and os.path.exists(vocab_path):
             tokenizer.load_vocab(vocab_path)
             print(f"  ✓ 語彙ファイルを読み込み: {vocab_path}")
         else:
@@ -287,31 +590,58 @@ def test_round_trip(
                 print(f"    音符範囲: {min(n.start for n in drum_track.notes)} ~ {max(n.end for n in drum_track.notes)} ticks")
         # =====================================
 
-        tokens, bar_positions = tokenizer.midi_to_tokens(midi_path)
-        print(f"  ✓ トークン列を生成")
-        print(f"  トークン数: {len(tokens)}")
+        first_note_tick = get_first_drum_note_tick(original_midi)
+        first_note_beat = None
+        if first_note_tick is not None and original_midi.ticks_per_beat > 0:
+            first_note_beat = first_note_tick / original_midi.ticks_per_beat
+
+        tokens = None
+        cp_data = None
+        indices = None
+
+        if tokenization_method == 'cp_limb_v1':
+            cp_data, bar_positions = tokenizer.midi_to_cp_data(midi_path)
+            n_events = len(cp_data['event_type'])
+            print(f"  ✓ CPイベント列を生成")
+            print(f"  イベント数: {n_events}")
+        else:
+            tokens, bar_positions = tokenizer.midi_to_tokens(midi_path)
+            indices = tokenizer.tokens_to_indices(tokens)
+            print(f"  ✓ トークン列を生成")
+            print(f"  トークン数: {len(tokens)}")
+
         print(f"  小節数: {len(bar_positions)}")
         result['steps']['midi_to_tokens'] = True
-        result['token_count'] = len(tokens)
+        result['token_count'] = len(cp_data['event_type']) if cp_data is not None else len(tokens)
         result['bar_count'] = len(bar_positions)
 
-        # トークン列をインデックスに変換
-        indices = tokenizer.tokens_to_indices(tokens)
-        print(f"  ✓ インデックス列に変換")
+        if tokenization_method != 'cp_limb_v1':
+            print(f"  ✓ インデックス列に変換")
 
         # ステップ3: pklファイルに保存
         print("\nステップ3: トークン列をpklファイルに保存")
         base_name = os.path.splitext(os.path.basename(midi_path))[0]
 
-        # トークン列（文字列）を保存
         tokens_pkl_path = os.path.join(output_dir, f"{base_name}_tokens.pkl")
         with open(tokens_pkl_path, 'wb') as f:
-            pickle.dump({
-                'tokens': tokens,
-                'indices': indices,
-                'bar_positions': bar_positions,
-                'vocab': tokenizer.idx2token
-            }, f)
+            if tokenization_method == 'cp_limb_v1':
+                pickle.dump({
+                    'tokenization_method': tokenization_method,
+                    'cp_data': cp_data,
+                    'bar_positions': bar_positions,
+                    'idx2struct_token': tokenizer.idx2struct_token,
+                    'idx2limb_token': tokenizer.idx2limb_token,
+                    'first_note_beat': first_note_beat,
+                }, f)
+            else:
+                pickle.dump({
+                    'tokenization_method': tokenization_method,
+                    'tokens': tokens,
+                    'indices': indices,
+                    'bar_positions': bar_positions,
+                    'vocab': tokenizer.idx2token,
+                    'first_note_beat': first_note_beat,
+                }, f)
         print(f"  ✓ トークン列を保存: {tokens_pkl_path}")
         result['steps']['save_tokens'] = True
         result['tokens_pkl_path'] = tokens_pkl_path
@@ -321,24 +651,60 @@ def test_round_trip(
         with open(tokens_pkl_path, 'rb') as f:
             loaded_data = pickle.load(f)
 
-        loaded_tokens = loaded_data['tokens']
-        loaded_indices = loaded_data['indices']
-        print(f"  ✓ トークン列を読み込み")
-        print(f"  読み込んだトークン数: {len(loaded_tokens)}")
+        loaded_tokens = None
+        loaded_cp_data = None
 
-        # トークン列が一致するか確認
-        if loaded_tokens == tokens:
-            print(f"  ✓ 保存/読み込みの整合性確認OK")
+        if tokenization_method == 'cp_limb_v1':
+            loaded_cp_data = loaded_data['cp_data']
+            print(f"  ✓ CPイベント列を読み込み")
+            print(f"  読み込んだイベント数: {len(loaded_cp_data['event_type'])}")
+
+            if loaded_cp_data == cp_data:
+                print(f"  ✓ 保存/読み込みの整合性確認OK")
+            else:
+                print(f"  ✗ 警告: 保存/読み込みで不一致")
         else:
-            print(f"  ✗ 警告: 保存/読み込みで不一致")
+            loaded_tokens = loaded_data['tokens']
+            loaded_indices = loaded_data['indices']
+            print(f"  ✓ トークン列を読み込み")
+            print(f"  読み込んだトークン数: {len(loaded_tokens)}")
+
+            if loaded_tokens == tokens:
+                print(f"  ✓ 保存/読み込みの整合性確認OK")
+            else:
+                print(f"  ✗ 警告: 保存/読み込みで不一致")
+
+        loaded_first_note_beat = loaded_data.get('first_note_beat')
+        if loaded_first_note_beat is not None:
+            print(f"  ✓ 先頭ノートbeat情報を読み込み: {loaded_first_note_beat:.4f}")
 
         result['steps']['load_tokens'] = True
 
         # ステップ5: トークン → MIDI変換
         print("\nステップ5: トークン列 → MIDIファイルへの変換")
-        converter = DrumToken2MIDI()
         reconstructed_midi_path = os.path.join(output_dir, f"{base_name}_reconstructed.mid")
-        midi_obj = converter.tokens_to_midi(loaded_tokens, reconstructed_midi_path)
+
+        if tokenization_method == 'cp_limb_v1':
+            midi_obj = cp_data_to_midi(
+                loaded_cp_data,
+                loaded_data['idx2struct_token'],
+                loaded_data['idx2limb_token'],
+                reconstructed_midi_path,
+                bpm=120,
+            )
+        elif tokenization_method == 'remi':
+            midi_obj = remi_tokens_to_midi(loaded_tokens, reconstructed_midi_path)
+        else:
+            converter = DrumToken2MIDI()
+            midi_obj = converter.tokens_to_midi(loaded_tokens, reconstructed_midi_path)
+
+        shift_ticks = align_reconstructed_midi_to_first_note_beat(midi_obj, loaded_first_note_beat)
+        if shift_ticks != 0:
+            shift_beats = shift_ticks / midi_obj.ticks_per_beat
+            print(f"  ✓ 先頭空小節補正を適用: shift={shift_ticks} ticks ({shift_beats:.4f} beats)")
+
+        midi_obj.dump(reconstructed_midi_path)
+
         print(f"  ✓ MIDIファイルを生成: {reconstructed_midi_path}")
 
         # ===== 追加: 再構築されたMIDI情報を表示 =====
@@ -351,6 +717,7 @@ def test_round_trip(
 
         result['steps']['tokens_to_midi'] = True
         result['reconstructed_midi_path'] = reconstructed_midi_path
+        result['applied_start_shift_ticks'] = shift_ticks
 
         # ステップ6: 元のMIDIと比較
         print("\nステップ6: 元のMIDIファイルと復元したMIDIファイルを比較")
@@ -373,10 +740,22 @@ def test_round_trip(
 
         result['steps']['comparison'] = True
         result['comparison'] = comparison_result
+        per_file_log_path = os.path.join(output_dir, f"{base_name}_comparison.log")
+        target_log_path = comparison_log_path or per_file_log_path
+        write_comparison_log(
+            target_log_path,
+            midi_path,
+            reconstructed_midi_path,
+            tokenization_method,
+            comparison_result,
+            append=comparison_log_path is not None,
+        )
+        result['comparison_log_path'] = target_log_path
 
         # 比較結果の表示
         print(f"\n  比較結果:")
         print(f"    一致したノート: {comparison_result['matched_notes']}/{comparison_result['total_notes_1']}")
+        print(f"    比較ログ: {target_log_path}")
 
         if comparison_result['timing_errors']:
             print(f"    タイミング誤差: {len(comparison_result['timing_errors'])}件")
@@ -401,14 +780,20 @@ def test_round_trip(
         if comparison_result['missing_notes']:
             print(f"    ✗ 欠損ノート: {len(comparison_result['missing_notes'])}件")
             for note in comparison_result['missing_notes'][:5]:
-                print(f"      - Pitch {note['pitch']}, Start {note['start']}, Vel {note['velocity']}")
+                print(
+                    f"      - Bar {note['bar']}, Beat {note['beat']}, Pos {note['position']:2d}, "
+                    f"{note['note_type']} (Pitch {note['pitch']}, Start {note['start']}, Vel {note['velocity']})"
+                )
             if len(comparison_result['missing_notes']) > 5:
                 print(f"      ... 他 {len(comparison_result['missing_notes']) - 5}件")
 
         if comparison_result['extra_notes']:
             print(f"    ✗ 余分なノート: {len(comparison_result['extra_notes'])}件")
             for note in comparison_result['extra_notes'][:5]:
-                print(f"      - Pitch {note['pitch']}, Start {note['start']}, Vel {note['velocity']}")
+                print(
+                    f"      - Bar {note['bar']}, Beat {note['beat']}, Pos {note['position']:2d}, "
+                    f"{note['note_type']} (Pitch {note['pitch']}, Start {note['start']}, Vel {note['velocity']})"
+                )
             if len(comparison_result['extra_notes']) > 5:
                 print(f"      ... 他 {len(comparison_result['extra_notes']) - 5}件")
 
@@ -459,6 +844,11 @@ def main():
                         help='語彙ファイルパス（オプション）')
     parser.add_argument('--single_file', type=str, default=None,
                         help='単一のMIDIファイルをテスト')
+    parser.add_argument('--tokenization_method', type=str, default='standard',
+                        choices=['standard', 'remi', 'cp_limb_v1'],
+                        help='トークナイズ方式 (default: standard)')
+    parser.add_argument('--all_methods', action='store_true',
+                        help='3方式 (standard/remi/cp_limb_v1) を連続実行')
 
     args = parser.parse_args()
 
@@ -486,13 +876,40 @@ def main():
         print(f"✗ エラー: テスト用MIDIファイルが見つかりません")
         return 1
 
-    print(f"\nテスト対象ファイル数: {len(midi_files)}")
+    methods = [args.tokenization_method]
+    if args.all_methods:
+        methods = ['standard', 'remi', 'cp_limb_v1']
 
-    # 各ファイルをテスト
+    print(f"\nテスト対象ファイル数: {len(midi_files)}")
+    print(f"実行方式: {', '.join(methods)}")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    global_comparison_log_path = os.path.join(args.output_dir, 'all_comparisons.log')
+    if os.path.exists(global_comparison_log_path):
+        os.remove(global_comparison_log_path)
+    print(f"集約比較ログ(全方式共通): {global_comparison_log_path}")
+
     results = []
-    for midi_path in midi_files:
-        result = test_round_trip(midi_path, args.output_dir, args.vocab_path)
-        results.append(result)
+    for method in methods:
+        method_output_dir = args.output_dir
+        if len(methods) > 1:
+            method_output_dir = os.path.join(args.output_dir, method)
+
+        os.makedirs(method_output_dir, exist_ok=True)
+
+        print(f"\n{'-' * 80}")
+        print(f"方式: {method}")
+        print(f"{'-' * 80}")
+
+        for midi_path in midi_files:
+            result = test_round_trip(
+                midi_path,
+                method_output_dir,
+                args.vocab_path,
+                tokenization_method=method,
+                comparison_log_path=global_comparison_log_path,
+            )
+            results.append(result)
 
     # 結果のサマリー
     print(f"\n{'=' * 80}")
@@ -505,7 +922,8 @@ def main():
     for result in results:
         status = "✓ 成功" if result['success'] else "✗ 失敗"
         filename = os.path.basename(result['input_file'])
-        print(f"{status:8s} - {filename}")
+        method = result.get('tokenization_method', 'standard')
+        print(f"{status:8s} - [{method}] {filename}")
 
         if 'comparison' in result:
             comp = result['comparison']

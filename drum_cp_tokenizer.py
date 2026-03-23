@@ -41,6 +41,12 @@ class DrumCPTokenizer:
         self.limb_token2idx = {tok: i for i, tok in enumerate(self.limb_vocab)}
         self.idx2limb_token = {i: tok for tok, i in self.limb_token2idx.items()}
 
+        # 既存コード互換: prepare_drum_dataset.py が tokenizer.vocab_size を参照する
+        self.struct_vocab_size = len(self.struct_vocab)
+        self.limb_vocab_size = len(self.limb_vocab)
+        self.event_type_vocab_size = len(self.event_type2idx)
+        self.vocab_size = self.struct_vocab_size
+
         # 0-23 を有効POS, 24 を PAD_POS として使用
         self.pos_pad_value = 24
 

@@ -408,7 +408,7 @@ class MuseMorphose(nn.Module):
 
   def compute_loss(self, mu, logvar, beta, fb_lambda, dec_logits, dec_tgt):
     recons_loss = F.cross_entropy(
-      dec_logits.view(-1, dec_logits.size(-1)), dec_tgt.contiguous().view(-1), 
+      dec_logits.reshape(-1, dec_logits.size(-1)), dec_tgt.contiguous().reshape(-1), 
       ignore_index=self.n_token - 1, reduction='mean'
     ).float()
 
@@ -427,18 +427,18 @@ class MuseMorphose(nn.Module):
 
   def _masked_ce(self, logits, targets, mask):
     if mask is None:
-      return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.contiguous().view(-1), reduction='mean')
+      return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.contiguous().reshape(-1), reduction='mean')
 
     if mask.dtype != torch.bool:
       mask = mask.bool()
 
     if mask.dim() > 1:
-      mask_flat = mask.view(-1)
+      mask_flat = mask.reshape(-1)
     else:
       mask_flat = mask
 
-    logits_flat = logits.view(-1, logits.size(-1))
-    targets_flat = targets.contiguous().view(-1)
+    logits_flat = logits.reshape(-1, logits.size(-1))
+    targets_flat = targets.contiguous().reshape(-1)
 
     if mask_flat.sum() == 0:
       return logits_flat.new_tensor(0.0)

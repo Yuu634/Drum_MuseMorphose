@@ -102,7 +102,7 @@ def main():
         print(f"  - {midi_file.name}")
 
     # ステップ2: 往復変換テスト
-    print_section("ステップ2: 往復変換テスト (MIDI → Token → MIDI)")
+    print_section("ステップ2: 往復変換テスト (MIDI → pkl → MIDI, 3方式)")
 
     round_trip_script = script_dir / "test_round_trip.py"
 
@@ -111,9 +111,10 @@ def main():
             python,
             str(round_trip_script),
             "--midi_dir", str(sample_midis_dir),
-            "--output_dir", str(output_dir)
+            "--output_dir", str(output_dir),
+            "--all_methods",
         ],
-        "往復変換テスト"
+        "往復変換テスト (standard/remi/cp_limb_v1)"
     )
     test_results.append(("往復変換テスト", success))
 
@@ -125,8 +126,8 @@ def main():
 
     verification_script = script_dir / "test_token_verification.py"
 
-    # 生成されたpklファイルを探す
-    pkl_files = list(output_dir.glob("*_tokens.pkl"))
+    # 生成されたpklファイルを探す（方式別サブディレクトリも含む）
+    pkl_files = list(output_dir.rglob("*_tokens.pkl"))
 
     if len(pkl_files) == 0:
         print("✗ pklファイルが見つかりません")

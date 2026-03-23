@@ -157,7 +157,7 @@ class DrumToken2MIDI:
                 max_bar += 1
         
         # 予期される全小節数を記録（空の小節を含む）
-        total_bars = max_bar
+        total_bars = max(1, max_bar)
 
         # トークンを解析してノートイベントを生成
         current_bar = 0
@@ -186,12 +186,6 @@ class DrumToken2MIDI:
                     midi_obj.tempo_changes.append(miditoolkit.TempoChange(target_tempo, current_tick))
                     current_tempo = target_tempo
                 pending_tempo = None
-
-                # 空小節追加
-                if i + 1 < len(tokens) and tokens[i+1] == '<BAR>':
-                    midi_obj.markers.append(
-                        miditoolkit.Marker(f'Bar-{current_bar}', (current_bar - 1) * DEFAULT_BAR_RESOL)
-                    )
 
             elif token.startswith('<BEAT_'):
                 beat_num = int(token.replace('<BEAT_', '').replace('>', ''))
@@ -291,11 +285,11 @@ class DrumToken2MIDI:
         midi_obj.instruments.append(drum_track)
 
         # 全小節のマーカーを追加（空の小節を含む）
-        # これにより、元譜面の全小節が再構築される
-        #for bar in range(total_bars):
-        #    midi_obj.markers.append(
-        #        miditoolkit.Marker(f'Bar-{bar + 1}', bar * DEFAULT_BAR_RESOL)
-        #    )
+        # 譜面表示側で先頭空小節を保持しやすくする
+        for bar in range(total_bars):
+            midi_obj.markers.append(
+                miditoolkit.Marker(f'Bar-{bar + 1}', bar * DEFAULT_BAR_RESOL)
+            )
 
         # MIDIの終了時刻を設定（全小節を包含するように）
         midi_obj.end_time = total_bars * DEFAULT_BAR_RESOL
@@ -373,6 +367,14 @@ if __name__ == '__main__':
     # テスト用
     test_tokens = [
         '<BAR>',
+        '<TEMPO_66>',
+        '<BAR>',
+        '<TEMPO_66>',
+        '<BAR>',
+        '<TEMPO_66>',
+        '<BAR>',
+        '<TEMPO_66>',
+        '<BAR>',
         '<BEAT_1>', '<POS_0>', 'KICK_HIT_Normal', 'HH_CLOSED_HIT_Normal',
         '<POS_6>', 'HH_CLOSED_HIT_Ghost',
         '<POS_12>', 'SNARE_HIT_Normal', 'HH_CLOSED_HIT_Normal',
@@ -390,6 +392,6 @@ if __name__ == '__main__':
     ]
 
     print("Converting test tokens to MIDI...")
-    midi_obj = tokens_to_midi(test_tokens, '/tmp/test_drum_output.mid', bpm=120)
+    midi_obj = tokens_to_midi(test_tokens, 'test_drum_output.mid', bpm=120)
     print(f"Created MIDI with {len(midi_obj.instruments[0].notes)} notes")
-    print("Saved to: /tmp/test_drum_output.mid")
+    print("Saved to: test_drum_output.mid")

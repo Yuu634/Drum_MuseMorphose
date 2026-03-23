@@ -393,6 +393,47 @@ def compute_all_difficulty_scores(bar_tokens: List[str], bpm: float = 120.0) -> 
     }
 
 
+def _cp_data_to_tokens(cp_data: Dict, idx2struct: Dict, idx2limb: Dict) -> List[str]:
+    """
+    CP形式データを難易度計算用のトークン列に復元する。
+
+    Args:
+        cp_data: CP形式のデータ（event_type, struct_token, cp_pos, cp_hand1, etc.）
+        idx2struct: 構造トークンのインデックス→トークン辞書
+        idx2limb: 肢トークンのインデックス→トークン辞書
+
+    Returns:
+        復元されたトークンリスト
+    """
+    tokens = []
+
+    for ev_type, struct_id, pos_id, h1, h2, rf, lf in zip(
+        cp_data['event_type'],
+        cp_data['struct_token'],
+        cp_data['cp_pos'],
+        cp_data['cp_hand1'],
+        cp_data['cp_hand2'],
+        cp_data['cp_right_foot'],
+        cp_data['cp_left_foot'],
+    ):
+        # 0: STRUCT, 1: CP
+        if int(ev_type) == 0:
+            st = idx2struct.get(int(struct_id), '<PAD>')
+            if st != '<PAD>':
+                tokens.append(st)
+            continue
+
+        if int(pos_id) < 24:
+            tokens.append(f'<POS_{int(pos_id)}>')
+
+        for limb_id in (h1, h2, rf, lf):
+            limb_tok = idx2limb.get(int(limb_id), '<PAD>')
+            if limb_tok not in ('<PAD>', '<NONE>'):
+                tokens.append(limb_tok)
+
+    return tokens
+
+
 # ============================================================================
 # 境界値計算・離散化
 # ============================================================================
@@ -407,9 +448,18 @@ def compute_difficulty_bounds(data_dir: str, vocab_path: str, output_path: str, 
         output_path: 境界値を保存するパス
         bpm: デフォルトBPM
     """
-    # 語彙を読み込み
+    # 語彙を読み込み（CP形式と標準形式の両方に対応）
     with open(vocab_path, 'rb') as f:
-        token2idx, idx2token = pickle.load(f)
+        vocab_data = pickle.load(f)
+
+    is_cp_vocab = isinstance(vocab_data, dict) and vocab_data.get('tokenization_method') == 'cp_limb_v1'
+    
+    if is_cp_vocab:
+        idx2struct = vocab_data['idx2struct_token']
+        idx2limb = vocab_data['idx2limb_token']
+        idx2token = None
+    else:
+        token2idx, idx2token = vocab_data
 
     all_scores = {
         's_tech': [],
@@ -419,7 +469,7 @@ def compute_difficulty_bounds(data_dir: str, vocab_path: str, output_path: str, 
         's_move': []
     }
 
-    files = [f for f in os.listdir(data_dir) if f.endswith('.pkl')]
+    files = sorted([f for f in os.listdir(data_dir) if f.endswith('.pkl') and f not in ('dataset_stats.pkl', 'train_split.pkl', 'val_split.pkl')])
     print(f'Found {len(files)} pickle files')
 
     for i, file in enumerate(files):
@@ -449,8 +499,23 @@ def compute_difficulty_bounds(data_dir: str, vocab_path: str, output_path: str, 
                 if st >= ed or ed > len(tokens):
                     continue
 
-                bar_token_indices = tokens[st:ed]
-                bar_tokens = [idx2token.get(int(idx), '<PAD>') for idx in bar_token_indices]
+                # CP形式と標準形式で異なるトークン列復元ロジック
+                if is_cp_vocab and isinstance(tokens, dict):
+                    # CP形式の復元
+                    bar_cp_data = {
+                        'event_type': tokens['event_type'][st:ed],
+                        'struct_token': tokens['struct_token'][st:ed],
+                        'cp_pos': tokens['cp_pos'][st:ed],
+                        'cp_hand1': tokens['cp_hand1'][st:ed],
+                        'cp_hand2': tokens['cp_hand2'][st:ed],
+                        'cp_right_foot': tokens['cp_right_foot'][st:ed],
+                        'cp_left_foot': tokens['cp_left_foot'][st:ed],
+                    }
+                    bar_tokens = _cp_data_to_tokens(bar_cp_data, idx2struct, idx2limb)
+                else:
+                    # 標準形式の復元
+                    bar_token_indices = tokens[st:ed]
+                    bar_tokens = [idx2token.get(int(idx), '<PAD>') for idx in bar_token_indices]
 
                 scores = compute_all_difficulty_scores(bar_tokens, bpm=bpm)
 

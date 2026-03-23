@@ -1,54 +1,54 @@
-# MuseMorphose CP Mode Guide
+# MuseMorphose CPモードガイド
 
-This document describes the limb-based CP mode implemented for drum training and generation.
+このドキュメントでは、ドラム学習および生成向けに実装した四肢ベースCPモードについて説明します。
 
-## Overview
+## 概要
 
-CP mode introduces a composite event representation:
+CPモードでは、以下の複合イベント表現を導入しています。
 
-- CP event: [Position, Hand1, Hand2, Right_Foot, Left_Foot]
-- Structural event: <TEMPO_xxx>, <BAR>, <BEAT_x>, <EOS>
+- CPイベント: [Position, Hand1, Hand2, Right_Foot, Left_Foot]
+- 構造イベント: <TEMPO_xxx>, <BAR>, <BEAT_x>, <EOS>
 
-Key points:
+重要ポイント:
 
-- Hand slots are hand-agnostic (Hand1/Hand2), not right/left hand fixed.
-- HH_PEDAL is assigned to Left_Foot.
-- Hi-hat hits can be assigned to Hand1/Hand2.
-- CP element tokens keep instrument+technique+velocity information.
+- 手スロットは利き手非依存で、右手/左手固定ではなく Hand1/Hand2 を使います。
+- HH_PEDAL は Left_Foot に割り当てます。
+- ハイハット打撃は Hand1/Hand2 のどちらにも割り当て可能です。
+- CP要素トークンは instrument+technique+velocity の情報を保持します。
 
-## Tokenization Method Switch
+## トークナイズ方式の切り替え
 
-Use config key:
+設定キー:
 
-- data.tokenization_method: standard or cp_limb_v1
+- data.tokenization_method: standard または cp_limb_v1
 
-Files where this switch is supported:
+この切り替えに対応しているファイル:
 
 - train_drum.py
 - prepare_drum_dataset.py
 - drum_dataloader.py
 
-## CP Embedding Design
+## CP埋め込み設計
 
-CP mode uses CP-specific embedding in the model:
+CPモードでは、モデル内でCP専用埋め込みを使用します。
 
-1. Embed each CP element independently:
+1. CPの各要素を独立に埋め込む
    - Position embedding
    - Hand1 embedding
    - Hand2 embedding
    - Right_Foot embedding
    - Left_Foot embedding
-2. Concatenate the five embeddings
-3. Project through a linear layer to model dimension
+2. 5つの埋め込みをConcatする
+3. 線形層でモデル次元へ投影する
 
-Config keys:
+関連設定キー:
 
 - model.d_cp_pos_emb
 - model.d_cp_limb_emb
 
-## CP Output Heads
+## CP出力ヘッド
 
-CP mode predicts multi-head outputs per timestep:
+CPモードでは、各時刻で以下の多頭出力を予測します。
 
 - event_type head
 - structural head
@@ -58,96 +58,122 @@ CP mode predicts multi-head outputs per timestep:
 - cp_right_foot head
 - cp_left_foot head
 
-Loss is masked by event type:
+損失は event_type に応じてマスクして計算します。
 
-- event_type: all valid timesteps
-- structural: structural timesteps only
-- CP element heads: CP timesteps only
+- event_type: 有効時刻すべて
+- structural: structural時刻のみ
+- CP要素ヘッド: CP時刻のみ
 
-Config key for per-head weighting:
+ヘッドごとの損失重み設定キー:
 
 - model.cp_loss_weights
 
-## Data Preparation (CP)
+## データ準備
 
-### 1) Build CP dataset
+### 1) データセットの作成
 
-Example:
+例:
 
-python prepare_drum_dataset.py \
-  --midi_dir /path/to/midis \
+python3 prepare_drum_dataset.py \
+  --midi_dir dataset \
+  --output_dir ./drum_dataset_remi \
+  --vocab_path ./drum_vocab_remi.pkl \
+  --file_extension .midi \
+  --tokenization_method remi
+
+python3 prepare_drum_dataset.py \
+  --midi_dir dataset \
+  --output_dir ./drum_dataset_standard \
+  --vocab_path ./drum_vocab.pkl \
+  --file_extension .midi \
+  --tokenization_method standard
+
+python3 prepare_drum_dataset.py \
+  --midi_dir dataset \
   --output_dir ./drum_dataset_cp \
   --vocab_path ./drum_vocab_cp.pkl \
-  --file_extension .mid \
+  --file_extension .midi \
   --tokenization_method cp_limb_v1
 
-### 2) (Optional) Add difficulty labels
+### 2) 難易度閾値の算出
 
-Example:
+例:
 
-python prepare_drum_dataset_with_difficulty.py \
-  ./drum_dataset_cp \
-  ./drum_vocab_cp.pkl \
-  ./difficulty_bounds.pkl \
-  ./drum_dataset_cp_with_difficulty
+python3 compute_difficulty_bounds.py drum_dataset_remi drum_vocab_remi.pkl difficulty_bounds_remi.pkl 120
 
-## Training (CP)
+python3 compute_difficulty_bounds.py drum_dataset_standard drum_vocab.pkl difficulty_bounds_standard.pkl 120
 
-Set in config:
+python3 compute_difficulty_bounds.py drum_dataset_cp drum_vocab_cp.pkl difficulty_bounds_cp.pkl 120
+
+### 3) 難易度ラベルの付与
+
+例:
+
+python3 prepare_drum_dataset_with_difficulty.py drum_dataset_remi drum_vocab_remi.pkl difficulty_bounds_remi.pkl drum_dataset_remi_with_difficulty
+
+python3 prepare_drum_dataset_with_difficulty.py drum_dataset_standard drum_vocab.pkl difficulty_bounds_standard.pkl drum_dataset_standard_with_difficulty
+
+python3 prepare_drum_dataset_with_difficulty.py drum_dataset_cp drum_vocab_cp.pkl difficulty_bounds_cp.pkl drum_dataset_cp_with_difficulty
+
+## 学習（CP）
+
+configで以下を設定してください。
 
 - data.tokenization_method: cp_limb_v1
-- data.vocab_path: path to CP vocab pickle
-- data.data_dir: CP dataset directory
+- data.vocab_path: CP語彙pickleのパス
+- data.data_dir: CPデータセットのディレクトリ
 
-Then run:
+実行:
 
-python train_drum.py --config config/drum_config_gpu.yaml
+CUDA_VISIBLE_DEVICES=2 python3 train_drum.py --config config/drum_config_remi.yaml
+CUDA_VISIBLE_DEVICES=1 python3 train_drum.py --config config/drum_config_standard.yaml
+CUDA_VISIBLE_DEVICES=0 python3 train_drum.py --config config/drum_config_cp.yaml
 
-Notes:
+注意:
 
-- Existing standard mode remains supported.
-- Checkpoint compatibility requires matching tokenization mode and head setup.
+- 既存のstandardモードも引き続き利用可能です。
+- チェックポイント互換性は、tokenization mode とヘッド構成が一致している必要があります。
 
-## CP Generation Script
+## CP専用生成スクリプト
 
-New script:
+新規スクリプト:
 
 - generate_drum_cp.py
 
-Usage:
+使い方:
 
-python generate_drum_cp.py <config> <ckpt> <output_dir> <n_pieces> <n_samples_per_piece>
+python3 generate_drum_cp.py <config> <ckpt> <output_dir> <n_pieces> <n_samples_per_piece>
 
-Example:
+例:
 
-python generate_drum_cp.py \
+python3 generate_drum_cp.py \
   configs/train_drum_difficulty.yaml \
   checkpoints_drum_gpu/params/step_50000-RC_0.123-KL_-0.000-model.pt \
   ./outputs_cp \
   3 \
   2
 
-Output files:
+出力ファイル:
 
-- *.mid : generated MIDI
-- *.txt : generated CP event log
+- *.mid : 生成MIDI
+- *.txt : 生成されたCPイベントログ
 
-## CP to MIDI Conversion Helpers
+## CPからMIDIへの変換ヘルパー
 
-Added helper functions in drum_to_midi.py:
+drum_to_midi.py に以下の関数を追加しています。
 
 - cp_events_to_tokens(cp_data, idx2struct_token, idx2limb_token)
 - cp_data_to_midi(cp_data, idx2struct_token, idx2limb_token, output_path, bpm=None)
 
-These convert CP event sequences to existing token form and then to MIDI.
+これらは、CPイベント系列を既存トークン形式へ復元し、その後MIDIへ変換します。
 
-## Current Scope and Limitation
+## 現在の実装範囲と制約
 
-- CP training path is implemented.
-- CP generation script is implemented.
-- Existing generate_drum_difficulty.py is kept for standard-oriented generation and intentionally rejects cp_limb_v1 mode.
+- CP学習経路は実装済みです。
+- CP生成スクリプトは実装済みです。
+- 既存の generate_drum_difficulty.py は standard向け運用を維持し、cp_limb_v1 モードを明示的に拒否します。
 
-## Minimal Config Example (CP)
+## 最小設定例（CP）
 
 model:
   d_cp_pos_emb: 64
