@@ -58,7 +58,7 @@ def compute_loss_ema(ema, batch_loss, decay=0.95):
         return batch_loss * (1 - decay) + ema * decay
 
 
-def train_model(epoch, model, dloader, dloader_val, optim, sched, config, trained_steps, scaler=None):
+def train_model(epoch, model, dloader, dloader_val, optim, sched, config, trained_steps, scaler=None, best_val_loss=float('inf')):
     """モデルの学習（1エポック）"""
     model.train()
 
@@ -326,14 +326,26 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched, config, traine
         # 検証
         if not trained_steps % val_interval:
             vallosses = validate(model, dloader_val, config)
+            current_val_loss = np.mean(vallosses[0])  # 再構成損失を使用
+            
             with open(os.path.join(ckpt_dir, 'valloss.txt'), 'a') as f:
                 f.write('[step {}] RC: {:.4f} | KL: {:.4f} | [val] | RC: {:.4f} | KL: {:.4f}\n'.format(
                     trained_steps,
                     recons_loss_ema,
                     kl_raw_ema,
-                    np.mean(vallosses[0]),
+                    current_val_loss,
                     np.mean(vallosses[1])
                 ))
+            
+            # ベストモデルの保存
+            if current_val_loss < best_val_loss:
+                best_val_loss = current_val_loss
+                torch.save(
+                    model.state_dict(),
+                    os.path.join(params_dir, 'best_params.pt')
+                )
+                print(f'[info] New best model saved! (val_loss: {best_val_loss:.4f})')
+            
             model.train()
 
         # チェックポイントの保存
@@ -365,7 +377,7 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched, config, traine
         is_init=not os.path.exists(os.path.join(ckpt_dir, 'log.txt'))
     )
 
-    return trained_steps
+    return trained_steps, best_val_loss
 
 
 def validate(model, dloader, config, n_rounds=8):
@@ -679,8 +691,10 @@ def main():
 
     # 学習ループ
     print('[info] Starting training...')
+    best_val_loss = float('inf')
+    
     for ep in range(config['training']['max_epochs']):
-        trained_steps = train_model(
+        trained_steps, best_val_loss = train_model(
             ep + 1,
             model,
             dloader,
@@ -689,9 +703,29 @@ def main():
             scheduler,
             config,
             trained_steps,
-            scaler=scaler
+            scaler=scaler,
+            best_val_loss=best_val_loss
         )
 
+    # 学習終了時に最終モデルを保存
+    print('[info] Saving final model...')
+    torch.save(
+        model.state_dict(),
+        os.path.join(params_dir, 'final_params.pt')
+    )
+    print(f'[info] Final model saved to {os.path.join(params_dir, "final_params.pt")}')
+    
+    # best_params.ptが存在しない場合は最終モデルをベストモデルとして保存
+    best_params_path = os.path.join(params_dir, 'best_params.pt')
+    if not os.path.exists(best_params_path):
+        torch.save(
+            model.state_dict(),
+            best_params_path
+        )
+        print(f'[info] Best model saved to {best_params_path}')
+    else:
+        print(f'[info] Best model already exists at {best_params_path} (val_loss: {best_val_loss:.4f})')
+    
     print('[info] Training completed!')
 
 

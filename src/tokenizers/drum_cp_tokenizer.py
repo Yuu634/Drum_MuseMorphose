@@ -13,7 +13,7 @@ from typing import Dict, List, Tuple
 import miditoolkit
 import numpy as np
 
-from drum_tokenizer import (
+from src.tokenizers.drum_tokenizer import (
     DEFAULT_BAR_RESOL,
     DEFAULT_BEAT_RESOL,
     DRUM_NOTE_MAP,
